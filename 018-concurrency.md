@@ -13075,9 +13075,13 @@ actor A  {
 前面笔者多次提到过隔离这个术语, 实际上它的本质就是actor对象. 所有Swift元素的隔离属性有3种情况:
 1. `GlobalActor.share`: 如全局对象默认位于`MainActor.shared`
 2. actor对象
-3. 非隔离区: 通过`nonisolated(unsafe)`修饰
+3. 非隔离: 
+    - 通过`nonisolated(unsafe)`修饰的对象
+    - actor内部通过noisolated修饰的成员方法
+    - 普通异步函数
+    - 普通函数
 
-下面是笔者的总结:
+在这里笔者先作一个全局的总结:
 
 ```swift
 let n1 = 20     // 全局任何地方使用安全
@@ -13088,7 +13092,7 @@ nonisolated(unsafe) let n3 = 20 // 此处的 nonisolated(unsafe) 是多余的
 
 nonisolated(unsafe) var n3 = 20 // 指定为非隔离区, 意味着非线程安全
 
-// MainActor.shared, 可能因为Task或Group机制导致运行时异常(后续会有案例说明其原因)
+// MainActor.shared, 后续可能因为Task或Group机制导致运行时异常(后续会有案例说明其原因)
 let lambda_1 = {}
 
 let lambda_2:@Sendable () -> () = {}    // 向编译器说明闭包参数对象是一个可发送的类型(类似于值传递),
@@ -13102,85 +13106,61 @@ var lambda_3 = {} // MainActor.shared, 同n2
 var lambda_4:@Sendable ()->() = {}      // 同lambda_2 
 
 
-func f1() {}        // 没有隔离区
-func f2() async {}  // 没有隔离区
+func f1() {}        // 非隔离
+func f2() async {}  // 非隔离
 @MainActor func f3(){} // MainActor.shared
 
 
 
 // enum同理
 struct A{
-    // 必须指定, 无隔离区
+    // 必须指定, 非隔离区
     nonisolated(unsafe) static var n1 = 0        
     static let n2 = 0                   // Sendable
-    @MainActor static var n3 = 0        // MainActor
+    @MainActor static var n3 = 0        // MainActor.shared
 
-    static func f1() {}                 // 无隔离
-    static func f2() async {}           // 无隔离
+    static func f1() {}                 // 非隔离
+    static func f2() async {}           // 非隔离
     @MainActor static func f3() {}      // MainActor.shared
 
     let n1 = 0                          // self是一个Sendable对象, 所以n1使用是安全的
     var n2 = 0                          // 同 self.n1
 
-    func f1(){}                         // 无隔离
-    func f2()async{}                    // 无隔离
+    func f1(){}                         // 非隔离
+    func f2()async{}                    // 非隔离
     @MainActor func f3(){}              // MainActor.shared
 }
 
-// 关于class的情况后续再学习
-```
 
-
-### `#isolation`
-它是一个表达式宏, 可以获取当前上下文所在的隔离区(actor)
-
-```swift
-// 在async main的环境下获取的隔离区(actor)为 MainActor.shared
-// 如果整个程序是不是异步环境, 则为nil
-let actor = #isolation
-
-guard let main_actor = actor else {
-    fatalError()
-}
-
-func f1()  {
-    main_actor.assumeIsolated {
-        print($0)
-    }
-}
-
-f1()        // 没有问题,由async main直接调用f1
-
-func f2() async {
-    f1()    // 异常, f2没有在主线程的隔离区, 所以后面 assumeIsolated 直接异常
-}
-
-await f2()
-
-/////////////////////////////////////
-func f() async {
-    let actor = #isolation  // nil, async没有在任何隔离区
-}
-await f()
-
-
-////////////////////////////////////
 actor A {
-    func f() async {
-        let actor = #isolation //实际上是this的地址
-    }
-}
+    // 必须指定, 非隔离区
+    nonisolated(unsafe) static var n1 = 0
+    static let n2 = 0                   // Sendable
+    @MainActor static var n3 = 0        // MainActor.shared
 
-let a = A()
-await a.f(
+    static func f1() {}                 // 非隔离
+    static func f2() async {}           // 非隔离
+    @MainActor static func f3() {}      // MainActor.shared
+
+    let n1 = 0                          // Sendable
+    var n2 = 0                          // self(当前actor对象)
+                                        // PS: 这里不同于struct, n2的使用是安全的(actor的隔离机制)
+
+    func f1(){}                         // self
+    func f2()async{}                    // self
+    @MainActor func f3(){}              // MainActor.shared
+}
 ```
 
-> 这里不需探究actor获取过程
+关于class的与隔离的关系, 将在后续学习
+
+
+
 
 ### Task初始化过程1
 目前为止AsyncTask创建的场景有:
 - 程序的main函数创建`main-AsyncTask`
-- `async let _ = someAsyncFunc()`
+- `async let _ = someFunc()`
 
 这两种场景会导致`swift_task_create`被调用, 还可以使用Task创建异步任务, 先来看它的声明
 
@@ -13232,16 +13212,11 @@ public struct Task<Success: Sendable, Failure: Error>: Sendable {
   }
 }
 
+
 @discardableResult
 @_alwaysEmitIntoClient
 public init(
 priority: TaskPriority? = nil,
-
-//_inheritActorContext 表示继承传递的参数所在的隔离区:
-//  如果参数是一个普通函数, 则隔离区为nil
-//  如果参数是一个非隔离区的函数, 则隔离区为nil
-//  如果参数是一个@MainActor函数, 则隔离区为MainActor.shared
-//  如果参数是一个actor内部的隔离成员函数, 则隔离区为该actor对象
 @_inheritActorContext @_implicitSelfCapture operation: sending @escaping @isolated(any) () async -> Success
 ) {
     // 创建AsyncTask(异步任务, 前面有该类的源码注解)
@@ -13263,9 +13238,7 @@ priority: TaskPriority? = nil,
     addPendingGroupTaskUnconditionally: false,
     isDiscardingTask: false)
 
-    // 因为operation被@isolated(any)修饰, 所以可以让编译器获取传递operation闭包时所处的隔离区
-    // 在当前的测试流程中该值是MainActor.shared(actor对象)
-    // PS: 用户可以调用 operation.isolation 获取当前的隔离区(any Actor?)
+    
     let builtinSerialExecutor =
         Builtin.extractFunctionIsolation(operation)?.unownedExecutor.executor
 
@@ -13285,8 +13258,7 @@ priority: TaskPriority? = nil,
 所以必须从汇编层面来了解整个过程:
 
 ```lua
-; 由于测试程序太简单了, 所以Swift做了优化, 整个程序并非一个async main开启的异步函数
-; PS: 程序的逻辑实际就在Switf层面创建一个Task对象
+; 整个程序并非一个async main开启的异步函数, 因为逻辑上是在创建一个Task对象
 swift`main:
 0x1000035d8 <+0>:   stp    x20, x19, [sp, #-0x20]!
 0x1000035dc <+4>:   stp    x29, x30, [sp, #0x10]
@@ -13535,14 +13507,13 @@ swift`Task<>.init(priority:operation:):
 这整个过程如下面的伪代码:
 
 ```cpp
-
 void main(){
     // 因为 clouser的签名有 @_inheritActorContext属性,
     // 所以编译器会匹配当前调用者(main)的隔离区, MainActor的隔离区由MainActor.shared.unownedExecutor决定
     // PS: ActorContext是笔者自定义的, 并不存在这样的类型
     ActorContext* heap = swift_allocObject(32)
-    heap.actorObject = MainActor.shared
-    heap.actorWitnessTable = MainActor.witnessTable
+    heap->actorObject = MainActor.shared
+    heap->actorWitnessTable = MainActor.witnessTable
     Task.init(nullptr/*priority*/, {2}/*closure闭包*/, heap)
 }
 
@@ -13559,7 +13530,7 @@ void Task.init(
         flags |= priority    // 前8bit是优先级
     }
 
-    SerialExecutor executor = heap.actorOjbect.unownedExecutor
+    SerialExecutor executor = heap->actorOjbect.unownedExecutor
 
     InitialSerialExecutorTaskOptionRecord op;
     op.Flags = 0
@@ -13574,9 +13545,9 @@ void Task.init(
 } 
 ```
 
-后续会调用到`swift_task_create_commonImpl`
+> 这里需要强调一点: 由于向函数传递的op记录了此刻所在的隔离区, 所以会导致创建的异步任务运行在该隔离区中!! 以当前的测试流程来看`task-AsyncTask`启动后会在`gcd_main_q`上运行
 
-> 这里需要强调一点: 由于向函数传递的op记录了此刻所在的隔离区, 所以会导致创建的异步任务运行在该Executor中!! 以当前的测试流程来看`task-AsyncTask`启动后,会在`gcd_main_q`上运行
+后续会调用到`swift_task_create_commonImpl`
 
 ```cpp
 SWIFT_CC(swift)
@@ -13629,8 +13600,7 @@ swift_task_create_commonImpl(size_t rawTaskCreateFlags,
 7. func会在主队列上被启动(下一次的runloop), 然后启动`swift_job_run(task-AsyncTask, {gcd_main_q, MainActor.executorWitnessTable})`
 8. 后续逐步调用到Task的闭包
 
-其实第3步开始就和前面MainActor一样的过程了, 由于当前测试程序十分简单, 没有async main, 所以第6步异步注册的函数不会调用到!
-> 第6步骤后程序在当前线程中又继续往后执行, 最后程序直接结束
+其实第3步开始就和前面MainActor一样的过程了, 由于后续是向`gcd_main_q`注册一个异步回调(第6步), 而主线程在创建完`task-AsyncTask`后, 后续直接结束了程序, 所以闭包还未来得及执行!
 
 
 ### Task初始化过程2
@@ -13826,7 +13796,7 @@ swift`Task<>.init(priority:operation:):
 0x100002190 <+548>: ret
 ```
 
-发现传递一个非隔离的异步函数时, Task内部获取的Executor为空, 这要决定了Task启动后, 会在全局的并发队列中运行闭包函数(后续的过程就不验证了). 同样的道理对于下面的测试代码:
+发现传递一个非隔离的异步函数时, Task内部获取的SerialExecutor为空, 这要决定了Task启动后, 会在全局的并发队列中运行闭包函数(后续的过程就不验证了). 同样的道理对于下面的测试代码:
 
 ```swift
 func f() {
@@ -13837,8 +13807,8 @@ Task(operation: f)      // 初始化器内部获取的executor也是空, 所以t
                         // 同时f是以普通函数被调用
 ```
 
-### 6.0下的lambda
-全局的lambda默认在MainActor中, 如果在编译期手动调用时,编译器会强制要求附加await, 这样可以保证是安全的
+### Task初始化过程3(全局lambda)
+前面两个小节中进行初始化时传递的是匿名闭包和函数, 也可以向其传递一个命名lamda对象, 当前小节讨论全局lambda.  全局的lambda默认在MainActor中(<font color = red>6.0版本</font>), 如果在编译期手动调用时,编译器会强制要求附加await, 这样可以保证是安全的
 
 ```swift
 // 测试1
@@ -13853,23 +13823,26 @@ var abc: /*@Sendable*/() ->() = {
 }
 
 func f2() async {
-    // 编译报错: 在非隔离区的f2环境下访问一个MainActor隔离区的可变对象abc(函数类型的对象)
-    //          这个行为不是线程安全的. 即使abc没有在任何地方被重新指定, 编译器也不允许!!!
-    //          从本质上来看abc是引用, 所以编译器无法保证在访问abc时, abc是独占的,
-    //          为此使用 @Sendable 修饰 abc, 这样告诉编译器abc是像值类型一样的可发送类型.
-    // PS: 值类型在传递过程中是bit拷贝, 所以互相传递时一定是独立的内存空间. 
-    //     Sendable后面详细学习
+    // 编译报错, 至于原因以笔者的总结来理解:
+    //   1. abc是引用类型(闭包本身是一个heap对象)
+    //   2. f2是非隔离 
+    //   3. abc隔离区为MainActor.shared
+    //  所以在f2访问abc时, 有数据竞争的风险(只有在同一隔离区下访问才是安全的)
+    //  编译器在编译期就识别出了这个不安全的行为,所以报错! 
+    // 
+    // 解决方案方式1:
+    //  使用 @Sendable 修饰 abc, 这样向编译器保证abc可以安全的在多线程间传递.
+    //  PS: Sendable后续会学习, 所以后续会说明原因
     await abc()
 }
 
-// 编译报错: 报错的原因和 f2中的一样,
-//           因为会创建一个新的异步任务在非隔离区的环境下访问abc, 所以编译器报错
+// 编译报错: async let将创建一个非隔离的 async-AsyncTask, 所以原因同f2
 async let _ = abc() 
 ```
 
-> 报错的2个地方除了对abc附加`@Sendable`外, 还可以主动指定abc为非隔离`nonisolated(unsafe) var abc = {xxx}`
+> 报错的两个地方除了对abc附加`@Sendable`外, 还可以主动指定abc为非隔离`nonisolated(unsafe) var abc = {xxx}`
 
-demo中这种报错可以在编译期就发现, 但如果将隔离区的abc传递给Task, 则就有问题:
+demo中这种报错可以在编译期就发现, 但如果将abc传递给Task初始化器的参数, 则有运行时问题:
 
 ```swift
 // 测试2
@@ -13877,49 +13850,58 @@ var abc: () ->() = {
     print(pthread_main_np())
 }
 
-Task(operation: abc) 
+Task(operation: abc)        // __code_compile_no_error
 
+func f() {
+    // Task(operation: abc) // __code_compile_error
+}
 pause()  
 ```
 
-这个测试中不会在编译期报错!! 但运行起来后报错. 原因是: abc在传递给Task的初始化参数operation时, 类型被强制转换成了
+这个测试中不会在编译期报错!! 但运行起来后报错. 通过反复调试发现: abc在传递给Task的初始化参数operation时, 类型被强制转换成了
 
 > `sending @escaping @isolated(any) () async -> ()`
 
-最后在运行时`task-AsyncTask`运行在并发队列的子线程中(非隔离区), 最后调用abc这个闭包的地址时,  闭包内部会生成一个队列检查的函数:
+导致编译器认为abc是一个Sendable对象, 所以它是安全的, 可以通过编译. 但是当`task-AsyncTask`启动后运行在并发队列的子线程中(非隔离区), 执行到abc,  abc内部调用了一个队列检查的函数:
 
 > `swift_task_isCurrentExecutorImpl(gcd_main_q)`
+> 
+> 由于abc声明在`MainActor.shared`的隔离区, 所以编译器生成的实现中传递了`gcd_main_q`. 
 
-其中`gcd_main_q`是编译器生成abc这个lambda函数时, 发现abc位于MainActor中, 所以获取到的是主队列, 而abc在运行时是在全局并发队列中, 所以最后Dispatch检查时发现2个队列不相等, 直接异常!!
-
-当然导致异常是由于观察汇编后发现的, 实际上该原因和测试1中相同! 只是由于Swift将abc的函数类型进行了强制转换, 让编译器认为:
-1. 转换后是sending类型(Sendable), 说明abc即使在后续的逃逸闭包中被访问也是安全的(必然发生类似bit拷贝的安全复制)
-2. 转换后是async函数, 这样`task-AsyncTask`启动后将在MainActor的隔离区调用abc
-
-> 满足2个之一就可以了
-
-但也只是让编译器认为, 实际在运行时abc本身不是Sendable且也不是异步函数, 所以它就是一个普通的函数, 它的汇编中存在`swift_task_isCurrentExecutorImpl`检查, 所以解决方案:
-
+Dispatch检查时发现2个队列不相等, 直接异常!! 所以对应的解决方案1:
+- 标注abc为Sendable
 ```swift
 // 方案1: 声明为Sendble, 这样闭包的汇编中不会生成swift_task_isCurrentExecutorImpl
 var abc: @Sendable ()->() = {
     print(pthread_main_np())  // 这种情况下不运行在主线程
 }
- 
+```
+> 这种方案下abc的实现内部没有`swift_task_isCurrentExecutorImpl`的调用, 最终运行时就没有问题
 
-// 方案2: 声明为异步函数(相当于默认指定了MainActor)
-var abc:() async -> () = {
-    print(pthread_main_np())  // 这种情况下不运行在主线程
+
+解决方案2
+- 标注abc为的实现为异步函数(笔者测试出来的)
+
+```swift
+// 方案2: 声明为异步
+var abc:() async -> () = {    // 非隔离
+    print(pthread_main_np())  // 0
 }
+```
+> 这种方案下相当于传递给了`Task`一个异步函数(同初始化过程2)
 
+解决方案3:
+- 标注abc的实现位于固定的隔离区
+
+```swift
 // 方案3: 主动指定MainActor
-var abc:@MainActor () -> () = {
-    print(pthread_main_np())  // 这种情况下不运行在主线程
+var abc:@MainActor () -> () = { // MainActor.shared
+    print(pthread_main_np())    // 1
 }
 ```
 
 ### Task怎么不执行?
-前面的小节测试案例中, 最终`task-AsyncTask`不会执行它接收的闭包或函数! 其实这个原因已经说过了, 这里来总结一下. 因为`task-AsyncTask`的启动要经过一次队列的调度, 所以:
+在前面初始化器过程的1和2中, 最终`task-AsyncTask`不会执行它接收的闭包或函数! 其实这个原因已经说过了, 这里来总结一下. 因为`task-AsyncTask`的启动要经过一次队列的调度, 所以:
 1. 初始化过程1中创建完毕`task-AsyncTask`后需要主队列的异步调度, 但创建完任务后整个程序就结束了, 所以不会执行
 2. 初始化过程2中也是同样的道理, 需要并发队列进行一个异步调度, 但程序已经结束了
 
@@ -13963,158 +13945,347 @@ pause()
 // 测试3 
 @MainActor func f1() {}
 func f2() async {
-    // 传递一个无隔离的函数也执行
+    // 传递一个非隔离的函数也执行
     Task(operation: f1)
 
     // Task{}   // 也执行, task-AsyncTask启动在f2所在的隔离区, 而f2
-                // 为无隔离, 会导致task-AsyncTask启动在SerialExecutor{nullptr, nullptr}
+                // 为非隔离, 会导致task-AsyncTask启动在SerialExecutor{nullptr, nullptr}
                 // 运行在子线程
 }
 await f2()
 ```
 
-这种情形下程序是一个async main的异步函数, 当调用`await f2`时, 主线程等待f2进入runloop, 而f2传递的f1本身在MainActor的隔离区, 导致`task-AsyncTask`启动在主队列, 主队列被唤醒后执行f1这个异步函数. 如果传递的是一个无隔离的异步函数, 也是同样的道理, 只不过运行在并发队列上
+这种情形下程序是一个async main的异步函数, 当调用`await f2`时, 主线程等待f2进入runloop, 而f2传递的f1本身在MainActor的隔离区, 导致`task-AsyncTask`启动在主队列, 主队列被唤醒后执行f1这个异步函数. 如果传递的是一个非隔离的异步函数, 也是同样的道理, 只不过运行在并发队列上
 
-> 关于Task启动时位于哪个Executor将在下一小节探究
+关于Task启动时位于哪个Executor笔将从三个方面来探究:
+1. 传递函数
+2. 传递命名的lambda
+3. 传递匿名的lambda
 
 
-### Task启动Executor的规则1
-前面的2个初始化过程:
-1. 如果传递的是匿名的lambda(闭包)会导致`task-AsyncTask`启动后在主队列上运行
-2. 如果传递的是函数(包括非隔离的异步函数)最终会运行在并发队列中
 
-这看起来好像operation参数本身在什么隔离区就决定Task被创建成为后启动就在什么Executor(隔离区决定Executor)! 笔者认为需要进一步测试:
-1. 如果在一个无隔离的异步函数中向Task传递一个匿名lambda后, 启动在哪个Executor?
-2. 如果在一个无隔离的异步函数中向Task传递一个MainActor的函数, 启动在哪个Executor?
-3. 如果在一个actor的成员方法中向 Task传递一个匿名lambda后, 启动在哪个Executor?
-4. 如果在一个actor的成员方法中向 Task传递一个MainActor的函数, 启动在哪个Executor?
 
-> 后面的测试, 笔者直接描述结果, 并不会展开汇编!!
-
-其实就是测试Task调用环境会不会影响Task启动的Executor, 然后用户传递的闭包被调用时会不会发生从Executor的切换? 先来看第1场景:
+### Task启动Executor1
+最直观的是参数operation有明确的隔离时, 将直接在该隔离区对应的SerialExecutor上启动:
 
 ```swift
-func f() async {    // 无隔离 ==> SerialExecutor{nullptr, nullptr}
-    Task{}          // 无隔离 ==> 同上,  逻辑上task-AsyncTask继承了f的隔离区
+/////////////////// 测试1
+@MainActor func f() {           // 明确了隔离为MainActor.shared
+    print(pthread_main_np())
 }
-await f() 
-```
+Task(operation: f)              // 启动SerialExecutor为{gcd_main_q, MainActor.executorWitnessTable}
 
-在汇编层面当调用`Task.init`时传递的与actor相关的数据:
-1. `(*x2)<0x10 ~ 0x17 bit>(nullptr)`: 隔离actor对象
-2. `(*x2)<0x18 ~ 0x1f bit>(nullptr`: `actor.witnessTable`
-
-
-> `Task.init`内部通过空的actor对象获取到的SerialExecutor也是空, 最后创建的`task-AsyncTask`将在`SerialExectuor{nullptr, nullptr}`上启动, 用户传递的闭包也在`SerialExecutor{nullptr, nullptr}`! 从这一点来看在逻辑上就造成`task-AsyncTask`隔离区继承自f的隔离区.
-
-接下来看第2种场景:
-
-```swift
-@MainActor func main_f() {}     // MainActor.shared ==> SerialExecutor{gcd_main_q, MainActor.executorWitnessTable}
-
-func f() async {                // 无隔离 ==> SerialExecutor{nullptr, nullptr}
-    Task(operation: main_f)     // MainActor.shared ==> SerialExecutor{gcd_main_q, MainActor.executorWitnessTable} 
+func f1() {
+    Task(operation: f)          // 同上
 }
-await f() 
-```
 
-> 调用环境是无隔离(f为无隔离), 但传递的operation参数是一个MainActor的异步函数, Swift将直接传递`MainActor.shared, MainActor.witnessTable`到Task.init中, 然后在内部获取到的SerialExecutor为`{gcd_main_q, MainActor.executorWitnessTable}`, 所以最后`task-AsyncTask`启动在主队列. 
 
-接下来看第3种场景:
+////////////////// 测试2
+func f() {                      // 明确了隔离为非隔离
+    print(pthread_main_np())
+}
 
-```swift
-actor ABC {
-    func f() async {            // 隔离区是abc对象 ==> SerialExecutor{abc对象地址, nullptr}, 最终底层依赖DefaultActor
-        Task{}                  // 无隔离          ==> SerialExecutor{nullptr, nullptr}
+Task(operation: f)              // 启动的SerialExecutor为{nullptr, nullptr}
+
+func f1() {
+    Task(operation: f)          // 同上
+}
+
+
+
+////////////////// 测试2
+func f() {                      // 非隔离
+    print(pthread_main_np())
+}
+
+actor A {
+    func f() {
+        Task(operation: f)      // 启动的SerialExecutor为{nullptr, nullptr}
     }
 }
-var abc = ABC()
-await abc.f()
+let a = A()
+await a.f()
 ```
 
-> 调用环境有隔离(abc对象), 但Swift传递给`Task.init`的actor信息为空, 所以最后`task-AsyncTask`启动在`SerailExecutor{nullptr, nullptr}`
+> Task启动后的Executor由函数本身的隔离区决定
+
+### Task启动Executor2
+如果传递的是lambda对象, 则Task逻辑上要通过包装一层函数, 然后在函数内部调用这个lambda
+```swift
+////////////////// 测试1
+let f =  {                      // MainActor.shared
+    print(pthread_main_np())
+}
+
+Task(operation: f)              // 先包装一个非隔离的异步函数tmp-func,
+                                // tmp-func启动在 SerialExectuor{nullptr, nullptr},
+                                // 然后内部调用f的时候切换为SerialExecutor{gcd_main_q, MainActor.executorWitnessTable}
+                                // PS: 这会导致运行时异常(原因前面已经描述过)
+
+func f2() {
+    Task(operation: f)          // 直接编译报错, 在非隔离区的f2下访问MainActor下的f
+}
 
 
-接下来看第4种场景:
+
+////////////////// 测试2
+let f:@Sendable () -> () = {    // Sendable(表示是安全的, 可以编译通过), 非隔离
+    print(pthread_main_np())
+}
+
+Task(operation: f)              // 启动的SerialExecutor{nullptr, nullptr}
+
+
+func f1() {
+    Task(operation: f)          // 同上
+}
+
+
+
+////////////////// 测试3
+let f: ()async -> () = {        // MainActor.shared
+    print(pthread_main_np())
+}
+
+Task(operation: f)              // 启动的SerialExecutor{gcd_main_q, MainActor.executorWitnessTable}
+
+func f1() async {
+    Task(operation: f)          // 编译报错, 因为非隔离环境下访问一个MainActor的隔离对象,
+                                // 可以对f添加@Sendable
+}
+```
+> 这里不能传递成员方法
+
+
+### Task启动Executor3
+前面2种传递在形式上都确定了隔离区:
+1. 函数定义时就已经确定好了
+2. 命名的lambda在定义时也确定好了
+
+但是当向Task传递一个匿名的lambda时, 若不指定其隔离区则有相应的机制, 先来看匿名lambda指定隔离区
 
 ```swift
-actor ABC  {
-    @MainActor func main_f() {}
-    func f() async {            // 隔离区是abc对象 ==> SerialExecutor{abc对象, nullptr}
-        Task(operation: main_f) // MainActor.shared==> SerialExecutor{gcd_main_q, MainActor.executorWitnessTable}
+////////////////// 测试1
+@globalActor actor ABC {
+    static var shared = ABC.init()
+
+}
+await Task {
+    @ABC () async -> () in      // 指定了隔离区有 ABC.shared
+                                // 所以Task启动的SerialExecutor{ABC.shared, nullptr}
+}.value 
+
+
+
+
+////////////////// 测试2
+let f:  () -> () =  {           // 明确了隔离为MainActor.shared
+    print(pthread_main_np())
+}
+
+await Task {
+    @MainActor () async -> () in // 指定了MainActor.shared
+    f()                          // 启动的SerialExecutor{gcd_main_q, MainActor.executorWitnessTable}
+                                 // 所以访问f没有问题
+}.value
+
+
+////////////////// 测试3
+let f:  () -> () =  {           // 明确了隔离为MainActor.shared
+    print(pthread_main_np())
+}
+
+@globalActor actor ABC {
+    static var shared = ABC.init()
+
+}
+await Task {
+    @ABC () async -> () in      // 指定了隔离区有 ABC.shared
+                                // 所以Task启动的SerialExecutor{ABC.shared, nullptr}
+    f()                         // 运行时异常(原因前面已经解释过)
+}.value 
+```
+
+
+
+### Task启动Executor4
+如果在传递匿名lambda时, 不想指定任何隔离区, 则有一套隔离区继承机制. 通过前面的汇编探究可以发现最终`task-AsyncTask`运行的SerialExecutor追根溯源是调用`Task.init`的调用者决定. 通过笔者的测试发现其实是由`Task.init`的参数operation的属性决定:
+1. `@_inheritActorContext`
+2. `@_implicitSelfCapture `
+3. `@isolated(any)`
+
+首先这3个属性只能修饰函数类型(<font color = red>注意是类型, 函数定义时不允许</font>). 
+
+
+<a id="link-inherit-actor"></a>
+
+`@_inheritActorContext`决定了传递的隔离区:
+1. MainActor上下文中调用`Task.init`时, 传递`MainActor.shared`
+2. 非隔离上下文中调用   `Task.niit`时, 传递空actor
+3. actor隔离成员方法内部调用`Task.init`时,传递当前actor对象
+
+
+`_implicitSelfCapture`只在actor隔离成员方法中有效, 决定了: 
+1. 若调用`Task.init`是一个闭包, 且闭包内部引用了self(当前actor对象), 则传递当前actor对象
+2. 若调用`Task.init`是一个闭包, 但闭包内部未引用self(当前actor对象), 则传递空actor
+
+所以`Task.init`一定会接收一个`actor ?`的对象(<font color = red>见`初始化流程1`</font>), 同时operation又有`@isolated(any)`修饰, 所以编译器会根据所传递的actor对象获取SerialExecutor, 这样创建的`task-AsyncTask`将运行在该Executor上. 
+
+下面根据这几点来做测试:
+```swift
+////////////////// 测试1
+Task{}              // 1. 调用点在MainActor.shared
+                    // 2. 所以传递到Task.init的actor也是它
+                    // 3. 当前没在actor的成员方法内, 所以直接以 SerailExecutor{gcd_main_q, MainActor.executorWitenssTable}启动
+
+
+////////////////// 测试2
+func f() {
+    Task{}          // 1. 调用点在非隔离区
+                    // 2. 传递到Task.init的actor为空
+                    // 3. 启动SerialExecutor{nullptr, nullptr}(非隔离)
+}
+
+
+////////////////// 测试3
+actor A {
+    func f() {
+        Task{}      // 1. 调用点的隔离区为 self(当前actor对象)
+                    // 2. 传递到Task.init的actor为self
+                    // 3. 但是闭包中未引用self, 所以获取的是SerialExecutor{nullptr, nullptr}
     }
 }
-var abc = ABC()
-await abc.f() 
-```
 
-> 最终Task直接启动在主队列
-
-从这4种场景中不能通过有效的规律给出总结! 但笔者认为`Task.init`必定创建一个新的异步任务, 所以效果上Task的调用是非阻塞的, 所以它不能阻塞当前调用者, 从这一点出发上述所有的Task调用都保证了这一点. 说白了记住结论就行了, 对于actor内部的隔离成员方法, Task不会继承隔离区
-
-
-### Task启动Executor的规则2
-在actor的隔离成员方法中如果调用的Task捕获了当前的actor对象, 则Swift会做优化: `task-AsyncTask`将直接启动在`SerailExecutor{actor对象的地址, nullptr}`中, 也就是继承actor的隔离
-
-```swift
-actor ABC  {
-    func f() async {
-        // 调用环境的隔离区是 abc对象 ==> SerialExecutor{abc对象, nullptr}
-        Task {
-            // 由于闭包内引用了当前abc对象(self), 
-            // 编译器直接通过self获取了SerialExecutor, 然后`task-AsyncTask`将在该Executor上启动
+////////////////// 测试4
+actor A {
+    func f() {
+        Task{
             print(self)
+        }           // 1. 调用点的隔离区为 self(当前actor对象)
+                    // 2. 传递到Task.init的actor为self
+                    // 3. 同时闭包中引用了self, 所以获取的是SerialExecutor{self, nullptr}
+    }
+}
+```
 
-            #if false
-            实际上相当于隐式作了self的捕获
-            Task {
-                [isolated self] () -> () in
-                print(self)
-            }
-            #endif
+
+### `#isolation`
+它是一个表达式宏, 获取当前上下文所在的隔离区(actor对象), 可能获取到nil. 当获取到为nil时有一些静态特性!!
+
+```swift
+// 在async main的环境下获取的隔离区(actor)为 MainActor.shared
+// PS: 若程序本身并非async main, 则actor也是一样的值
+let actor = #isolation
+
+guard let main_actor = actor else {
+    fatalError()
+}
+
+func f1()  {
+    main_actor.assumeIsolated {
+        print($0)
+    }
+}
+
+f1()        // 没有问题, f1运行在MainActor.shared隔离区
+
+func f2() async { // f2为非隔离
+    f1()          // f1为非隔离, 
+                  // main_actor.assumeIsolated醒来应该在MainActor.shared中但却运行在非隔离,
+                  // 所以异常
+}
+await f2()
+
+/////////////////////////////////////
+func f() async {
+    let actor = #isolation  // nil, 非隔离
+}
+await f()
+
+
+////////////////////////////////////
+actor A {
+    func f() async {            // 隔离区为a对象
+        let actor = #isolation  // a对象 
+    }
+}
+
+let a = A()
+await a.f(
+```
+
+其实`#isolation`获取的值取决于[该属性](#link-inherit-actor)`@_inheriteActorContext`, 但同时它有一些静态特性(<font color = red>宏的机制</font>), 笔者整理了以下测试:
+
+```swift
+// error 测试1: 测试字面量nil的错误
+print(nil)          // 'nil' is not compatible with expected argument type 'Any'
+
+// ok    测试2: 测试对象为nil
+let n: Int? = nil
+print(n)            // 没有问题. 
+                    // PS: 不要与测试1中的结果产生纠结, 就是语法问题
+
+
+// ok    测试3: 直接在main.swift中书写这唯一的一句代码,
+print(#isolation)   // 整个程序并非一个异步程序(async main), 编译器
+                    // 直接获取了 MainActor.shared赋值给了临时对象, 然后打印临时对象
+
+
+// ok    测试4: 
+func f() {}         
+await f()            
+print(#isolation)   // 同测试3
+
+
+// error 测试5:
+func f() {              // 非隔离
+    print(#isolation)   // 获取到的actor为nil, 展开后为print(nil), 所以报错
+    // let iso = #isolation
+    // print(iso)       // 先使用对象引用一下, 再打印对象就没有问题
+}
+
+
+// error 测试6:
+func f() async{         // 非隔离
+    print(#isolation)   // 同测试5
+}
+
+// ok    测试7
+@MainActor func f() {   // MainActor.shared
+    print(#isolation)   // 同测试3
+}
+
+
+// ok    测试8
+Task {                  // Task接收的参数是一个匿名闭包, Task被调用点在MainActor, 所以闭包被执行在MainActor的隔离区
+    print(#isolation)   // 编译期就可以断定出#isolation是有值的
+}
+
+
+// error 测试9      
+actor A {
+    func f() {          // f的隔离区是self(当前actor对象)
+        Task {          // Task的调用点在self隔离区, 但闭包实现中未引用self. 所以闭包运行在非隔离区
+            print(#isolation)   // 获取为nil, 展开后是字面量nil, 所以报错
         }
     }
 }
-var abc = ABC()
-await abc.f() 
+
+
+// ok    测试10
+actor A {
+    func f() {
+        Task {
+            print(self)         // 引用了隔离者
+            print(#isolation)   // 所以这里获取的是有值的
+        }
+    }
+}
 ```
 
-
-
-
-
-
-
-
+> 这些发生错误的地址, 其实可以声明一个对象去接收`#isolation`, 这样打印就没有问题了
 
 ### `@isolation(any)`
-在探究初始化的过程前, 先来为该声明作出一些解释:
-1. 该初始化器是Swift接口文件的声明, 并不是完整的签名
-2. operation参数使用的`@isolated(any)`修饰(<font color = red>其他的2个属性这里先不关注</font>)
-
-这里要理解`isolated(any)`有什么作用, 先来看一个小demo
-
-```swift
-// 6.0, 默认是MainActor隔离区
-var number = 2
-
-await Task {
-    number += 2
-    return number
-}.value         // 编译到此没有问题, Task的尾随闭包中直接修改了number,
-                // 该尾随闭包在将来被调用时, 并不确定
-
-func f(@_inheritActorContext @_implicitSelfCapture n: @isolated(any) () async -> ()) async {
-
-}
-
-await f {
-    number += 2
-} 
-```
-
-
-
 
 ### TaskGroup
 
