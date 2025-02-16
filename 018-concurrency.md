@@ -13945,7 +13945,7 @@ pause()
 // 测试3 
 @MainActor func f1() {}
 func f2() async {
-    // 传递一个非隔离的函数也执行
+    // 传递一个MainAcotr的函数也执行
     Task(operation: f1)
 
     // Task{}   // 也执行, task-AsyncTask启动在f2所在的隔离区, 而f2
@@ -14047,7 +14047,10 @@ let f: ()async -> () = {        // MainActor.shared
     print(pthread_main_np())
 }
 
-Task(operation: f)              // 启动的SerialExecutor{gcd_main_q, MainActor.executorWitnessTable}
+Task(operation: f)              // 启动的SerialExecutor{nullptr, nullptr},
+                                // 但由于f是一个异步函数, 所以会切换到{gcd_main_q, MainActor.executorWitnessTable}执行f
+                                // PS: 注意这里和测试1是不一样的, 测试1中f就是一个普通的函数,
+                                //     所以不会有切换Executor的操作
 
 func f1() async {
     Task(operation: f)          // 编译报错, 因为非隔离环境下访问一个MainActor的隔离对象,
@@ -14364,6 +14367,112 @@ func f(cbk:@escaping @isolated(any) () async -> ()) async {
     await cbk()
 }
 ```
+
+### Task闭包捕获局部对象
+向Task提供一个匿名闭包时, 如果该闭包中捕获了局部对象, 其机制和逃逸闭包一样. 先来看普通函数下逃逸闭包捕获局部对象的问题
+
+```swift
+// 自定义一个前缀运算符
+prefix operator «
+
+extension BinaryInteger{
+    // eg: self = 100, return 0..<100
+    static prefix func « (_ number : Self) -> Range<Self> {
+        0..<number
+    }
+}
+
+func f() {
+    var n = 0
+    DispatchQueue.global().async{
+        for _ in «1000 {
+            n += 1
+        }
+    }
+    for _ in «1000 {
+        n += 1
+    }
+    sleep(1)    // 目的是尽量让子线程完成1000次的累加
+
+    print(n)    // 1865(某一次运行程序的测试结果)
+}
+f() 
+```
+测试中最后累加的值不等于2000, 说明n的访问过程不是线程安全的
+
+> PS: 闭包捕获局部对象时, 该局部对象实际是一个heap对象, 在逃逸闭包中对它的访问只是通过引用找到它的数据存储空间, 而同时在原函数中对n的访问也是一样的道理, 所以会有数据竞争! 其实说白了就是2条线程在同时修改同一块内存空间
+
+如果将这个测试转换成Task, 结果也是一样的:
+
+```swift
+func f() async {
+    var n = 0                   // __code_alloc_n
+
+    Task {                      // 传递的是匿名闭包 && 调用点是非隔离 && 非actor的成员方法, 所以
+                                // task-AsyncTask启动在SerailExecutor{nullptr, nullptr}
+        for _ in «1000 {        
+            n += 1              // __code_access_n_sub
+        }
+    }
+    for _ in «1000 {
+        n += 1                  // __code_access_n_f
+    }
+    sleep(1)            
+    print(n)        // 1981
+}
+
+await f() 
+```
+
+首先`task-Async`一定运行在并发队列中, 且极大概率和f不在同一线程
+> 因为Task的异步调度基本会在1秒内启动并执行, 此刻同一并发队列不可能派发f所在的线程来启动Task, 所以Task在另外的线程中. 
+
+然后需要关心的是局部对象n的整个过程:
+1. 初始化
+2. 传递
+3. 访问
+
+第1步初始化: 由于Task的闭包中捕获了局部对象n, 且它是一个逃逸闭包, 所以n一定位于heap中. 由于后续f函数访问了n, 所以同时被`f-ctx`(<font color = red>f的上下文</font>)引用
+
+
+f函将n作为参数调用给`Task.init`, 在`Task.init`内部创建了`task-arg3`, 后续Task启动后就可以得到n的地址并在闭包中访问到n.
+
+> arg3表示`task-AsyncTask`第1个异步函数的最后一个参数, 前面已经有arg3的汇编注解
+
+Task启动在了子线程, 此刻就造成Task所在的线程和f所在的线程同时修改n这块内存. 编译器不会像全局对象一样在编译期就向用户提示安全性的报错, 所以程序员自己心里要清楚这一点! 要和下面这种场景区分开(n是安全的)
+
+```swift
+func f() async{
+    var n = 0
+    await Task {
+        for _ in «1000 {
+            n += 1
+        }
+    }.value
+
+    for _ in «1000  {
+        n += 1
+    }
+
+    print(n)    // 2000
+}
+
+await f() 
+```
+
+上述这种情况下Task虽然可能和f不在同一线程, 但逻辑上f必须等待Task完成后才会执行累加, 所以不会有问题
+> 关于`Task{}.value`将在后续详细学习
+
+
+### Task初始化器复制TaskLocal
+在init中由于设置了`Task_CopyTaskLocals`, 所以
+
+
+### detach
+Task提供了一个detach的静态方法, 它和`init`不同的是:
+1. 启动的SerialExectuor是固定的`{nullptr, nullptr}`
+2. 逻辑上就是分离一个`new-AsyncTask`
+    - 不会复制`TaskLocal`
 
 ### TaskGroup
 
