@@ -9580,123 +9580,131 @@ func withValue<R>(
 func withValue<R>(_ valueDuringOperation: Value, operation: () throws -> R, file: String = #fileID, line: UInt = #line) rethrows -> R
 
 ```
-它们的调用格式是一样的, 但Swift会根据当前的上下自动使用对应的接口:
+
+对于第1种产生的调用场景:
+1. 当参数是函数时, 该函数是一个异步函数
+2. 当参数为命名闭包时, 该闭包是一个异步闭包
+3. 当参数为匿名闭包时, 手动指定为异步闭包
+
+> 也可以传递隔离区的函数或闭包, 下面这个是笔者举的第3种场景
 
 ```swift
-var n = TaskLocal.init(wrappedValue: 2)
-
-#if false
 nonisolated(unsafe)  var n = TaskLocal<Int>(wrappedValue: 20)
-func f() async {        // __code_with_f
-    // 对应的第1个 
-    n.withValue(30) {
-        var n1 = n.get()
-    }
+n.withValue(30) {
+    var n1 = n.get()
 }
-#endif
-
-
-var n1 = n.get()
-
-// 对应的是第2个(非异步的版本)
-n.withValue(30) {       // __code_with_main
-    var n1 = n.get()    // __code_closure_get
-}
-sleep(1)
-var n1 = n.get()        // __code_main_get  
 ```
 
-接着作测试, 相关的汇编如下:
+在本小节只需要关注withValue的过程, 测试代码如下:
+
+```swift
+var n = TaskLocal<Int>(wrappedValue: 20)
+
+// operation为非异步的版本
+n.withValue(30) {       
+    var n1 = n.get()    
+}
+```
+
+传递的是一个匿名闭包, 但调用的是非异步版本的withValue, 相关的汇编如下:
 
 ```lua
 swift`main:
-    0x100003af8 <+0>:   sub    sp, sp, #0xc0
-    0x100003afc <+4>:   stp    x22, x21, [sp, #0x90]
-    0x100003b00 <+8>:   stp    x20, x19, [sp, #0xa0]
-    0x100003b04 <+12>:  stp    x29, x30, [sp, #0xb0]
-    0x100003b08 <+16>:  add    x29, sp, #0xb0          
-    0x100003b0c <+20>:  mov    x21, #0x0                ; =0 
-    0x100003b10 <+24>:  str    x21, [sp, #0x38]
-    0x100003b14 <+28>:  adrp   x0, 5
-    0x100003b18 <+32>:  add    x0, x0, #0x0             ; demangling cache variable for type metadata for Swift.TaskLocal<Swift.Int>
-    0x100003b1c <+36>:  bl     0x100003c80              ; __swift_instantiateConcreteTypeFromMangledName at <compiler-generated>
-    0x100003b20 <+40>:  mov    x20, x0
-    0x100003b24 <+44>:  sub    x0, x29, #0x28
-    0x100003b28 <+48>:  mov    w8, #0x14                ; =20 
-    0x100003b2c <+52>:  stur   x8, [x29, #-0x28]
-    0x100003b30 <+56>:  bl     0x100003e88              ; symbol stub for: Swift.TaskLocal.__allocating_init(wrappedValue: τ_0_0) -> Swift.TaskLocal<τ_0_0>
+    0x100003b68 <+0>:   sub    sp, sp, #0xa0
+    0x100003b6c <+4>:   stp    x22, x21, [sp, #0x70]
+    0x100003b70 <+8>:   stp    x20, x19, [sp, #0x80]
+    0x100003b74 <+12>:  stp    x29, x30, [sp, #0x90]
+    0x100003b78 <+16>:  add    x29, sp, #0x90
+    0x100003b7c <+20>:  mov    x21, #0x0                ; =0 
+    0x100003b80 <+24>:  str    x21, [sp, #0x28]         ; *(sp + 0x28) = nullptr
+    0x100003b84 <+28>:  adrp   x0, 5
+    0x100003b88 <+32>:  add    x0, x0, #0x0             ; demangling cache variable for type metadata for Swift.TaskLocal<Swift.Int>
+    0x100003b8c <+36>:  bl     0x100003c90              ; __swift_instantiateConcreteTypeFromMangledName at <compiler-generated>
+    0x100003b90 <+40>:  mov    x20, x0
+    0x100003b94 <+44>:  sub    x0, x29, #0x28
+    0x100003b98 <+48>:  mov    w8, #0x14                ; =20 
+    0x100003b9c <+52>:  stur   x8, [x29, #-0x28]
+    0x100003ba0 <+56>:  bl     0x100003e94              ; symbol stub for: Swift.TaskLocal.__allocating_init(wrappedValue: τ_0_0) -> Swift.TaskLocal<τ_0_0>    
                                                         ; x0 = heap
-    0x100003b34 <+60>:  ldr    x3, [sp, #0x38]
-    0x100003b38 <+64>:  mov    x8, x0                   ; x8 = heap
-    0x100003b3c <+68>:  adrp   x9, 5
-    0x100003b40 <+72>:  str    x9, [sp, #0x18]
-    0x100003b44 <+76>:  adrp   x0, 5
-    0x100003b48 <+80>:  add    x0, x0, #0x10            ; swift.n : Swift.TaskLocal<Swift.Int>
-    0x100003b4c <+84>:  str    x8, [x9, #0x10]          ; *n = heap
-    0x100003b50 <+88>:  sub    x1, x29, #0x40
-    0x100003b54 <+92>:  str    x1, [sp, #0x28]
-    0x100003b58 <+96>:  mov    w8, #0x20                ; =32 
-    0x100003b5c <+100>: mov    x2, x8
-    0x100003b60 <+104>: bl     0x100003eb8              ; symbol stub for: swift_beginAccess
-    0x100003b64 <+108>: ldr    x8, [sp, #0x18]
-    0x100003b68 <+112>: ldr    x20, [x8, #0x10]         ; x20 = *n = heap
-    0x100003b6c <+116>: str    x20, [sp, #0x20]
-    0x100003b70 <+120>: mov    x0, x20
-    0x100003b74 <+124>: bl     0x100003f00              ; symbol stub for: swift_retain
-    0x100003b78 <+128>: ldr    x0, [sp, #0x28]
-    0x100003b7c <+132>: bl     0x100003ed0              ; symbol stub for: swift_endAccess
-    0x100003b80 <+136>: sub    x8, x29, #0x48
-    0x100003b84 <+140>: str    x8, [sp, #0x40]
-->  0x100003b88 <+144>: mov    w8, #0x1e                ; =30 
-    0x100003b8c <+148>: stur   x8, [x29, #-0x48]
-    0x100003b90 <+152>: adrp   x0, 0
-    0x100003b94 <+156>: add    x0, x0, #0xf30           ; "swift/main.swift"
-    0x100003b98 <+160>: mov    w8, #0x10                ; =16 
-    0x100003b9c <+164>: mov    x1, x8
-    0x100003ba0 <+168>: mov    w8, #0x1                 ; =1 
-    0x100003ba4 <+172>: and    w2, w8, #0x1
-    0x100003ba8 <+176>: bl     0x100003e58              ; symbol stub for: Swift.String.init(_builtinStringLiteral: Builtin.RawPointer, utf8CodeUnitCount: Builtin.Word, isASCII: Builtin.Int1) -> Swift.String
-    0x100003bac <+180>: ldr    x8, [sp, #0x30]
-    0x100003bb0 <+184>: ldr    x2, [sp, #0x38]
-    0x100003bb4 <+188>: mov    x3, x0
-    0x100003bb8 <+192>: ldr    x0, [sp, #0x40]
-    0x100003bbc <+196>: mov    x4, x1
-    0x100003bc0 <+200>: str    x4, [sp, #0x48]
-    0x100003bc4 <+204>: adrp   x1, 0
-    0x100003bc8 <+208>: add    x1, x1, #0xcec           ; closure #1 () -> () in swift at main.swift:10
-    0x100003bcc <+212>: mov    w9, #0xa                 ; =10 
-    0x100003bd0 <+216>: mov    x5, x9
-    0x100003bd4 <+220>: adrp   x9, 1
-    0x100003bd8 <+224>: ldr    x9, [x9, #0x48]
-    0x100003bdc <+228>: add    x6, x9, #0x8
-    0x100003be0 <+232>: bl     0x100003ea0              ; symbol stub for: Swift.TaskLocal.withValue<τ_0_0>(_: τ_0_0, operation: () throws -> τ_1_0, file: Swift.String, line: Swift.UInt) throws -> τ_1_0
-                                                        ; TaskLocal.withValue需要5个参数:
-                                                        ; this<TaskLocal<Int>>(x20(heap))
-                                                        ; x0<Int>(30)
-                                                        ; x1<()->()>(0x100003cec)
-                                                        ; x2<String>(nullptr), #fileID
-                                                        ; x3<Uint>(行号)
+    0x100003ba4 <+60>:  ldr    x3, [sp, #0x28]          ; x3 = nullptr
+    0x100003ba8 <+64>:  mov    x8, x0                   ; x8 = heap
+    0x100003bac <+68>:  adrp   x9, 5                    
+    0x100003bb0 <+72>:  str    x9, [sp, #0x8]           
+    0x100003bb4 <+76>:  adrp   x0, 5                
+    0x100003bb8 <+80>:  add    x0, x0, #0x10            ; swift.n : Swift.TaskLocal<Swift.Int>, x0 = n
+    0x100003bbc <+84>:  str    x8, [x9, #0x10]          ; *n = heap
+    0x100003bc0 <+88>:  sub    x1, x29, #0x40           ; x1 = local-0, 准备访问全局对象n
+    0x100003bc4 <+92>:  str    x1, [sp, #0x18]          ; *(sp + 0x18) = local-0
+    0x100003bc8 <+96>:  mov    w8, #0x20                ; =32(读动作)
+    0x100003bcc <+100>: mov    x2, x8                   
+    0x100003bd0 <+104>: bl     0x100003eb8              ; symbol stub for: swift_beginAccess
+    0x100003bd4 <+108>: ldr    x8, [sp, #0x8]           
+    0x100003bd8 <+112>: ldr    x20, [x8, #0x10]         ; x20 = *n = heap
+    0x100003bdc <+116>: str    x20, [sp, #0x10]         ; *(sp + 0x10) = heap
+    0x100003be0 <+120>: mov    x0, x20                  ; x0 = heap
+    0x100003be4 <+124>: bl     0x100003f00              ; symbol stub for: swift_retain
+    0x100003be8 <+128>: ldr    x0, [sp, #0x18]          ; x0 = local-0, 删除Access结点
+    0x100003bec <+132>: bl     0x100003ed0              ; symbol stub for: swift_endAccess
 
+    0x100003bf0 <+136>: add    x8, sp, #0x48            ; x8 = local-1
+    0x100003bf4 <+140>: str    x8, [sp, #0x38]          ; *(sp + 0x38) = local-1
+    
+->  0x100003bf8 <+144>: mov    w8, #0x1e                ; =30 
+    0x100003bfc <+148>: str    x8, [sp, #0x48]          ; *(sp + 48) = 30 ==> *local-1 = 30
+
+    0x100003c00 <+152>: adrp   x0, 0
+    0x100003c04 <+156>: add    x0, x0, #0xf30           ; "swift/main.swift"
+    0x100003c08 <+160>: mov    w8, #0x10                ; =16, 字符串长度 
+    0x100003c0c <+164>: mov    x1, x8
+    0x100003c10 <+168>: str    x1, [sp, #0x30]          ; *(sp + 0x38) = 16
+    0x100003c14 <+172>: mov    w8, #0x1                 ; =1 
+    0x100003c18 <+176>: and    w2, w8, #0x1
+    0x100003c1c <+180>: bl     0x100003e64              ; symbol stub for: Swift.String.init(_builtinStringLiteral: Builtin.RawPointer, utf8CodeUnitCount: Builtin.Word, isASCII: Builtin.Int1) -> Swift.String
+                                                        ; x0: String的前8字节, 这里String("swift/main.swift") 
+                                                        ; x1: String的后8字节
+
+    0x100003c20 <+184>: ldr    x8, [sp, #0x20]          ; x8 = nullptr, lldb调试出来, 没用的指令
+    0x100003c24 <+188>: ldr    x2, [sp, #0x28]          ; x2 = nullptr
+    0x100003c28 <+192>: ldr    x5, [sp, #0x30]          ; x5 = 16
+    0x100003c2c <+196>: mov    x3, x0                   ; x3 = String的前8字节
+    0x100003c30 <+200>: ldr    x0, [sp, #0x38]          ; x0 = local-1
+    0x100003c34 <+204>: mov    x4, x1                   ; x4 = String的后8字节
+    0x100003c38 <+208>: str    x4, [sp, #0x40]          ; *(sp + 0x40) = String的后8字节
+    0x100003c3c <+212>: adrp   x1, 0                    
+    0x100003c40 <+216>: add    x1, x1, #0xcfc           ; closure #1 () -> () in swift at main.swift:16
+    0x100003c44 <+220>: adrp   x9, 1
+    0x100003c48 <+224>: ldr    x9, [x9, #0x48]
+    0x100003c4c <+228>: add    x6, x9, #0x8
+    0x100003c50 <+232>: bl     0x100003eac              ; symbol stub for: Swift.TaskLocal.withValue<τ_0_0>(_: τ_0_0, operation: () throws -> τ_1_0, file: Swift.String, line: Swift.UInt) throws -> τ_1_0
+                                                        ; 传递了4个参数附加一个寄存器x2和this
+                                                        ;   this<TaskLocal<Int>>(x20(heap))
+                                                        ;   第0个参数value<Int*>(x0(local-1)):  local-1指向的空间中存储的是30
+                                                        ;   第1个参数operation<() -> ()>(0x100003cfc)
+                                                        ;       附加了一个x2参数(nullptr)
+                                                        ;   第2个参数file<String>({x3(前8字节), x4(后8字节)}): 闭包所在的文件名
+                                                        ;   第3个参数line<UInt>(x5(16)): 闭包所在的行号
+                                                         
+  ; 省略了后续的汇编(不关注)
+  ...                                          
 ```
 
-
-上述流程的汇编未结束, 因为要跳转到`TaskLocal<Int>.withValue`, 所以笔者按指令的执行顺序继续查看对应的源码:
+这里发现编译器调用withValue时传递的是一个临时对象, 该对象中存储了30. 也就是说withValue的内部是通过指针才能获取到30, 接着看源码的实现:
 
 ```cpp
+// 跳过了 withValue, 实际上来到这里时没有改变参数
 // this<TaskLocal<Int>>(x20(heap))
-// valueDuringOperation: x0<Int>(30)
-// operation: x1<() -> ()>(0x100003cec)
+// valueDuringOperation: x0<Int*>(30)
+// operation: x1<() -> ()>(0x100003cfc)
 @inlinable
-public func withValue<R>(_ valueDuringOperation: Value, operation: () throws -> R,
+public func withValueImpl<R>(_ valueDuringOperation: Value, operation: () throws -> R,
                         file: String = #fileID, line: UInt = #line) rethrows -> R {
     
     // 调用C++代码, swift_task_localValuePush
     // PS: C++的实现需要3个参数:
     //  key<HeapObject*>: heap
-    //  value<OpaqueValue*>: 30
+    //  value<OpaqueValue*>: Int*
     //  valueType<Metadata*>: Int.metadata
-    // 这里只传递了前2个参数, 是因为Swift在实现汇编时和源码有些差异, 
-    // 实际上第3个参数在汇编代码中已经置位(Int.metadata)
+    // PS: 源码这里在调用时只传递了前2个参数, 实际在汇编层面传递了额外的Int.metadata
     _taskLocalValuePush(key: key, value: valueDuringOperation)
 
 
@@ -9768,9 +9776,72 @@ static void swift_task_localValuePushImpl(const HeapObject *key,
 
 TaskLocal内部的defaultValue(wrappedValue)其实是一个只读类型, 所以一旦它进行了初始化, 后续不发生变化. TaskLocal的赋值操作(`withValue`)其实是一个假象, 它复制该参数的值到共享的位置, 后续通过闭包再将复制的参数值回调给用户, 最后闭包结束后会销毁这个复制, 这整个过程原始的TaskLocal对象内部的defaultValue并不涉及到. 至于这个共享位置: 当withValue的调用环境在一个异步函数时, 将复制到`cur-AsyncTask.Private.Local`, 如果没有任何异步任务环境, 则复制到`curThread.TLS.local`
 
-
 ### TaskLocal-4
-上一小节最后笔者总结了在某些情况下TaskLocal可以当作ThreadLocal, 下面看这个案例:
+上一小节中withValue整个过程就在主线程中, 所以前后对n的访问一定是线程安全的! 如果withValue在2条线程同时访问则会不会有问题? 以类比`ThreadLocal`的语义来理解`TaskLocal`则逻辑上必定不出现问题! 所以接下来要探究是Swift是怎么实现这种安全的? 
+
+```swift
+var n = TaskLocal<Int>(wrappedValue: 20)
+
+func f() async {
+    await n.withValue(30) {
+        () async ->  () in
+        var n1 = await n.get()  // 30
+    }
+}
+
+await f() 
+```
+
+整个过程如下:
+1. f运行在q中
+    - 并发队列
+
+2. 切换`gcd_man_q`获取n到上下文中tmpn1
+
+3. 切换到q调用`tmpn1.withValue(30)`
+    - 调用异步版本的实现
+    - 并在`main-AsyncTask`内部压栈30
+
+4. 在withValue内部切换到q执行闭包
+
+5. 闭包内部切换`gcd_main_q`获取n到tmpn2
+
+6. 切换到q执行`tmpn2.get()`
+
+7. get内部从当前的异步任务(`main-AsyncTask`)的TLS链表中取出的值为30
+
+8. 继续执行`withValue`, 将30出栈
+
+9. 第8步调用`n.get()`全部是`DefaultValue(20)`
+
+整个过程中来回切换队列的根本原因是全局对象n是MainActor属性(6.0下默认). 如果n本身并是一个非隔离的全局对象, 则这个过程是不是安全的???
+
+```swift
+nonisolated(unsafe) var n = TaskLocal<Int>(wrappedValue: 20)
+
+func f() async {
+    await n.withValue(30) {
+        () async ->  () in
+        var n1 = await n.get()
+    }
+}
+
+await f() 
+```
+
+和前一个测试不同的时, 所有对n的获取并不会切换队列, 而是在当前队列的线程下直接获取, 也就是说存在多个线程同时访问n的情况(<font color = red>当前测试来看只是表面上, 实际是顺序的</font>)! 但其实这个过程是安全的, 因为:
+1. n指向的内存空间本身是只读的
+    - 参见TaskLocal的Swift结构, 内部的defaultValue初始化后不会改变
+    > 这中间还牵扯到defaultValue是Sendalbe, 这个在后续将学习, 总之它是安全的
+
+2. n获取值的过程必须调用`n.get`, 而该方法内部从`cur-AsyncTask->localValueGet(n)`获取
+    > 整个流程中只有`main-AsyncTask`, 而在一个异步任务中所有的函数调用在逻辑上必定是顺序的, 所以同一时刻只有一条线程访问n, 这个过程是安全的 
+
+
+那么现在只剩下最后一种情况: 多线程下同时操作n! 这上留在下一小节
+
+### TaskLocal-5
+前面笔者总结了在某些情况下TaskLocal可以当作ThreadLocal, 下面看这个案例:
 
 ```swift
 nonisolated(unsafe) var n = TaskLocal<Int>(wrappedValue: 20)
@@ -9787,25 +9858,12 @@ sleep(1)
 print(n.get())                      // n.defaultValue(20)
 ```
 
-其实是n的作用就是提供一个key值用来关联
+这整个过程也是安全的, 因为:
+1. 复制n过程是安全的
+    - 复制n指向的内存到线程的TLS链表上
+2. 虽然整个过程没有异步任务, 但`n.get`的过程会从当前线程的TLS上获取, 所以获取的值是都独立的
 
 
-### TaskLocal-5
-在`swift_task_create_commonImpl`中有些操作是复制`parent.Private.local`到`new-AsyncTask.Private.local`的操作, 发生这种场景的代码如下:
-
-```swift
-nonisolated(unsafe) var n = TaskLocal<Int>(wrappedValue: 20)
-
-func f() async {
-    // value被Push到 main-AsyncTask.Private.local
-    n.withValue(Int(bitPattern: pthread_self())) {
-
-        print(n.get())  
-
-    } // Pop
-}
-await f() 
-```
 
 
 ### 异步函数可以是任意的表达式
@@ -14464,8 +14522,25 @@ await f()
 > 关于`Task{}.value`将在后续详细学习
 
 
-### Task初始化器复制TaskLocal
-在init中由于设置了`Task_CopyTaskLocals`, 所以
+### 复制TaskLocal
+在init中由于设置了`Task_CopyTaskLocals`, 所以在创建异步任务时会将当前异步任务下的TLS链表复制到新的异步任务中
+
+```swift
+nonisolated(unsafe) var n = TaskLocal<Int>(wrappedValue: 20)
+
+func f() async {
+    print(n.get())      // 20
+    n.withValue(30) {
+        print(n.get())  // 30
+        Task {          // copy f-AsyncTask.TLS.taskLink to task-AsyncTask.TLS.taskLink
+            print(n.get()) // 30
+        }
+    }
+
+    // n.withValue(50){}    // 不会出现 n.withValue(30)内部还未执行到创建Task时, 就已经执行到了 n.withValue(50)的情况
+}
+async let _ = f()       // copy main-AsyncTask.TLS.taskLink to f-AsyncTask.TLS.taskLink
+```
 
 
 ### detach
