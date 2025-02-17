@@ -9814,7 +9814,7 @@ await f()
 
 9. 第8步调用`n.get()`全部是`DefaultValue(20)`
 
-整个过程中来回切换队列的根本原因是全局对象n是MainActor属性(6.0下默认). 如果n本身并是一个非隔离的全局对象, 则这个过程是不是安全的???
+整个过程中来回切换队列的根本原因是全局对象n是MainActor属性(6.0下默认). 如果n本身是一个非隔离的全局对象, 则这个过程是不是安全的???
 
 ```swift
 nonisolated(unsafe) var n = TaskLocal<Int>(wrappedValue: 20)
@@ -9838,7 +9838,7 @@ await f()
     > 整个流程中只有`main-AsyncTask`, 而在一个异步任务中所有的函数调用在逻辑上必定是顺序的, 所以同一时刻只有一条线程访问n, 这个过程是安全的 
 
 
-那么现在只剩下最后一种情况: 多线程下同时操作n! 这上留在下一小节
+那么现在只剩下最后一种情况: 多线程下同时操作n! 这将留在下一小节
 
 ### TaskLocal-5
 前面笔者总结了在某些情况下TaskLocal可以当作ThreadLocal, 下面看这个案例:
@@ -13958,6 +13958,8 @@ var abc:@MainActor () -> () = { // MainActor.shared
 }
 ```
 
+<a id="link-task-no-exec"></a>
+
 ### Task怎么不执行?
 在前面初始化器过程的1和2中, 最终`task-AsyncTask`不会执行它接收的闭包或函数! 其实这个原因已经说过了, 这里来总结一下. 因为`task-AsyncTask`的启动要经过一次队列的调度, 所以:
 1. 初始化过程1中创建完毕`task-AsyncTask`后需要主队列的异步调度, 但创建完任务后整个程序就结束了, 所以不会执行
@@ -14530,24 +14532,85 @@ nonisolated(unsafe) var n = TaskLocal<Int>(wrappedValue: 20)
 
 func f() async {
     print(n.get())      // 20
-    n.withValue(30) {
+    n.withValue(30) {   // PUSH 30 to f-AsyncTask.Private.Local
+
         print(n.get())  // 30
-        Task {          // copy f-AsyncTask.TLS.taskLink to task-AsyncTask.TLS.taskLink
-            print(n.get()) // 30
+
+        Task {          // copy f-AsyncTask.Private.Local to task-AsyncTask.Private.Local
+
+            print(n.get()) // 30, from task-AsyncTask.Private.Local
         }
     }
 
     // n.withValue(50){}    // 不会出现 n.withValue(30)内部还未执行到创建Task时, 就已经执行到了 n.withValue(50)的情况
 }
-async let _ = f()       // copy main-AsyncTask.TLS.taskLink to f-AsyncTask.TLS.taskLink
+async let _ = f()       // copy main-AsyncTask-thread.TLS.Local to f-AsyncTask.Private.Local
 ```
 
 
 ### detach
 Task提供了一个detach的静态方法, 它和`init`不同的是:
-1. 启动的SerialExectuor是固定的`{nullptr, nullptr}`
-2. 逻辑上就是分离一个`new-AsyncTask`
-    - 不会复制`TaskLocal`
+1. 创建的`task-AsyncTask`的选项只有`enqueue`标识
+2. 不会做TaskLocal的复制
+
+
+```swift
+@discardableResult
+@_alwaysEmitIntoClient
+public static func detached(
+    priority: TaskPriority? = nil,
+    operation: sending @escaping @isolated(any) () async -> Success
+) -> Task<Success, Failure> {
+    // 只传递了enqueue
+    let flags = taskCreateFlags(
+        priority: priority, 
+        isChildTask: false, 
+        copyTaskLocals: false,
+        inheritContext: false, 
+        enqueueJob: true,
+        addPendingGroupTaskUnconditionally: false,
+        isDiscardingTask: false)
+
+let builtinSerialExecutor =
+    Builtin.extractFunctionIsolation(operation)?.unownedExecutor.executor
+
+let (task, _) = Builtin.createTask(flags: flags,
+                                    initialSerialExecutor:
+                                        builtinSerialExecutor,
+                                    operation: operation)
+return Task(task)
+}
+```
+
+看一下一个简单的测试程序:
+
+```swift
+nonisolated(unsafe)var n = TaskLocal<Int>(wrappedValue: 20)
+
+func f() async {    // subThreadA
+
+    Task.detatch {  // task-AsyncTask.Private.Local链表为空
+
+        sleep(1)    // 睡眠1秒 
+
+        print(await n.get())    // 调用get, 但task-AsyncTask-thread.TLS.Local为空, 所以读取的是 n.defaultValue(20)
+    }
+}
+
+async let _ = f()   // 分离出 f-AsyncTask, 它的local链表为空
+
+n.withValue(30) {   // 主线程, PUSH 30 to main-AsyncTask.Private.Local
+    sleep(2)        // 睡眠2秒, 保证链表上有30, 同时东西可以保证f的整个流程会执行完毕(包括Task)
+}
+```
+
+### Task没有等待机制
+[前面有些测试程序](#link-task-no-exec)中Task并不会执行, 笔者也解释了原因. 这同时也说明了任何创建Task的位置, 编译器都不会自动等待(这里就不再以汇编来查看了). 只有手动await形式才能保证Task会被阻塞等待:
+
+```swift
+ 
+```
+
 
 ### TaskGroup
 
