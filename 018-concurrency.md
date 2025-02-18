@@ -1681,20 +1681,18 @@ auto hook(FuncPtrT func, Args... arg) -> RetT {
     return func(arg...);
 }
 
-// 赋值转换成dst, 这个过程是内存重新解释, 如果类型不匹配则会
-// 发生运行时错误
+// 类型强制转换
 template<typename SrcPtrT, typename DstPtrT>
 auto reborn(SrcPtrT src, DstPtrT dst) -> rmv_p(DstPtrT)*{
-#define convinience(_src, _dst)  _src = reinterpret_cast<rmv_p(_src)*>(_dst)
-    convinience(src, dst);
-    return dst;
+#define convinience(_src, _dst)  reinterpret_cast<rmv_p(_dst)*>(_src)
+    return  convinience(src, dst);
 #undef convinience
 }
 #undef rmv_p
 
 void test_func(){
-    F2* f2 = func2;     
-    F3* f3 = func3;     
+    F2* f2 = func2;
+    F3* f3 = func3;
 
     hook<F2>(f2,    nullptr, nullptr);  // f2
     hook<F2>(func2, nullptr, nullptr);  // f2
@@ -1702,18 +1700,23 @@ void test_func(){
     hook<F3>(f3,    nullptr, nullptr, nullptr); // f3
     hook<F3>(func3, nullptr, nullptr, nullptr); // f3
 
-    // 将f3强制赋值成f2, 并调用
-    hook<F2>(reborn(f3, f2), nullptr, nullptr); // f2
-    
-    // 将f2强制赋值成f3, 并调用
-    hook<F3>(reborn(f2, f3), nullptr, nullptr, nullptr);// f3
+    // 真实函数类型是F3, 但函数声明需要的是F2, 实际调用的是F3
+    // PS: 在当前测试案例中存在问题(实际需要3个参数但少传递了一个),
+    //     类比taskEntry
+    //          1. 它的真实类型是3个参数 
+    //          2. 向后传递时的类型是2个参数, 但没产生调用
+    //          3. 最后传递给future_adapter时又被强制转换成3个参数, 并产生调用(调用时就没问题)
+    hook<F2>(reborn(f3, f2), nullptr, nullptr); // f3
+
+    // 真实函数类型是F2, 但函数声明需要的是F3, 实际调用的是F2
+    // PS: 这个调用逻辑上是错误的(因为真实类型需要的是2个参数)
+    hook<F3>(reborn(f2, f3), nullptr, nullptr, nullptr);// f2
 }
 
 void test(void) {
     test_func();
 } 
 ```
-> 举这个案例的目的是说明`taskEntry`前后指针类型不相同, 但最后在`future_adapter`函数中被转换成真实的类型后是调用成功的, 所以说编译器在调用`swift_task_create`时`ClosureEntry->Function.get()`的真实类型就是`void(*)(OpaqueValue*, AsyncContext*, void*)`(<font color = red>有返回值时</font>)
 
 回到前面的流程(即将进入common), 在真正进入到`swift_task_create_commonImpl`之前, 先来看一下异步任务的数据结构
 
@@ -3936,6 +3939,8 @@ func f3() async {
 }
 ```
 
+### 切换线程说明
+后面几个小节所探究的是否切换线程是基于测试案例, 真正是否切换线程的本质将在最后给出统一的结论
 
 ### 是否会切换线程1
 ```swift
@@ -5051,8 +5056,7 @@ func f1() async {   // 主线程
 
 f1()                // 主线程
 
-func async_main_1() async { // 主线程
-}
+func async_main_1() async { // 主线程}
 ```
 
 所以这里只需要看主线程中执行的f1, 以及它调用的`swift_task_switch`
