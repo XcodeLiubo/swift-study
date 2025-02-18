@@ -108,9 +108,10 @@ libswift_Concurrency.dylib`future_adapter:
 #define _8  8,
 #define _9  9
 #define _10  _0 _1 _2 _3 _4 _5 _6 _7 _8 _9
+#define _ZERO  _0 _0 _0 _0 _0 _0 _0 _0  _0 0
 
 
-#define _50     _10, _10, _10, _10, _10
+#define _50     _ZERO, _ZERO, _ZERO, _ZERO, _ZERO
 #define _100    _50, _50
 #define _500    _100, _100, _100, _100, _100
 
@@ -3940,7 +3941,7 @@ func f3() async {
 ```
 
 ### 切换线程说明
-后面几个小节所探究的是否切换线程是基于测试案例, 真正是否切换线程的本质将在最后给出统一的结论
+后面几个小节所探究的是否切换线程是基于测试案例, 是否需要切换线程需要根据当前的上下文判断`swift_task_switch`, 这个本质的原因将在最后给出.
 
 ### 是否会切换线程1
 ```swift
