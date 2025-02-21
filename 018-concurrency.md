@@ -14632,7 +14632,7 @@ extension Task {
     }
 }
 ```
-第2个成员方法是异常版本(<font color = Red>关注异步函数的异常机制, 后续学习</font>), 但其实2个方法内部的核心流程一样的, [前面](#link-async-wait)已经做过注解, 先来回顾async下阻塞等待的基本流程:
+第2个成员方法是异常版本(<font color = Red>关于异步函数的异常机制, 后续会提到一些</font>), 但其实2个方法内部的核心流程是一样的, [前面](#link-async-wait)已经做过注解, 先来回顾async下阻塞等待的基本流程:
 1. `cur-AsyncTask`中分离出`new-AsyncTask`
 2. `cur-AsyncTask`继续运行开始注册
     - `cur-AsyncTask`修改自己的启动地址和上下文(其中包括`new-AsyncTask`存储结果或异常的位置)
@@ -14893,7 +14893,7 @@ FutureFragment::Status AsyncTask::waitFuture(
 
         2. task-AsyncTask往前逐步返回, 并将结果2往回传递
 
-        3. task-AsyncTask往前返回到倒数第2个异步函数时, 会将2存储到f-AsyncTask.fragment.result中
+        3. task-AsyncTask往前返回到倒数第2个异步函数时, 会将2存储到f-AsyncTask.fragment.result(task-ctx往后回偏移sizeof(FutureAsyncContextPrefix))中
             这里牵扯到task-AsyncTask启动后result地址的传递过程, 前面swift_asyncLet_finish的过程已经详细注解过
 
         4. task-AsyncTask返回到最后一个异步函数completeTaskWithClosure
@@ -14906,7 +14906,7 @@ FutureFragment::Status AsyncTask::waitFuture(
         6. 在completeFuture内部, 遍历等待链表:
             1. 取出main-AsyncTask
             2. 取出上下文ctx-1 + 0x10(存储结果信息的上下文)
-            3. 将结果复制到ctx-1 + 0x10 的结果空间
+            3. 将结果从task-AsyncTask.fragment.result中复制到ctx-1 + 0x10 的结果空间
             4. 启动main-AsyncTask
 
         7. 第6.4步:
@@ -15063,7 +15063,7 @@ void AsyncTask::completeFuture(AsyncContext *context) {
 
     } else {    // true
       // 这里取出的是存储结果的地址(main-ctx + 0x18),
-      // 将fragment存储的2复制到main-ctx + 0x10指向的结果空间,
+      // 将fragment存储的2复制到main-ctx + 0x18指向的结果空间,
       // 后续async main需要的话就从这里取
       waitingContext->fillWithSuccess(fragment);
     }
@@ -15146,7 +15146,7 @@ swift`async_MainTQ0_:
                                                         ; 接下来会切换到主线程执行 0x100003458, 也就是main-AsyncTask往前返回的过程, 后续将结束程序
 ``` 
 
-通过汇编的分析, Task本身没有自动等待机制, 只有手动调用了`value`后, 才会走等待的流程, 而这个流程其实和async finish的差不多, 其实都是为了处理返回值(<font color = red>当然也包括销毁创建的异步任务</font>
+通过汇编的分析, Task本身没有自动等待机制, 只有手动调用了`value`后, 才会走等待的流程, 而这个流程其实和`swift_asyncLet_finish`差不多, 其实都是为了处理返回值(<font color = red>当然也包括销毁创建的异步任务</font>)
 
 ### TaskGroup
 
