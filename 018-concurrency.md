@@ -7991,7 +7991,7 @@ void AsyncTask::completeFuture(AsyncContext *context) {
                          this);
 
     // 将结果复制到main-AsyncTask的ResumeContext中,
-    // main-AsyncTask在最开始被创时
+    // main-AsyncTask在最开始被创建时
     //      > ResumeContext为main-AsyncTask + headerSize
     //      > 在swift_asyncLet_finish中被修改为asyncLet-getFutureContext(),
     //     所以主线程将来会在asyncLet->getFutureContext()上取得结果
@@ -8156,6 +8156,9 @@ var n2 = await result       // 第2次获取时, 结果已经存储好了, 直�
 1. 先调用`swift_asyncLet_getImpl`注册
 2. async main结束前还是会调用`swift_asyncLet_finish`销毁`f-AsyncTask`
 
+
+<a id="link-async-wait"></a>
+
 只需要关心
 ```cpp
 // 主线程
@@ -8173,8 +8176,7 @@ static void swift_asyncLet_getImpl(
 
   // 标记主动获取
   // PS: 由于是 await xxx, 则逻辑上一定是要等到结果存储好, 所以不会
-  //     存在n1还未获取到返回值, 就执行了n2
-  //     同一个异步任务中的所有异步函数是顺序执行的
+  //     存在n1还未获取到返回值, 就执行了n2!!(同一个异步任务中的所有异步函数是顺序执行的)
   asImpl(alet)->setHasResultInBuffer();
 
   swift_task_future_wait(reinterpret_cast<OpaqueValue*>(resultBuffer),
@@ -14610,12 +14612,541 @@ n.withValue(30) {   // 主线程, PUSH 30 to main-AsyncTask.Private.Local
 ```
 
 ### Task没有等待机制
-[前面有些测试程序](#link-task-no-exec)中Task并不会执行, 笔者也解释了原因. 这同时也说明了任何创建Task的位置, 编译器都不会自动等待(这里就不再以汇编来查看了). 只有手动await形式才能保证Task会被阻塞等待:
+[前面有些测试程序](#link-task-no-exec)中Task并不会执行, 笔者也解释了原因. 这意味着任何创建Task的位置不会自动等待. 只有手动await形式才能保证Task会被阻塞等待:
 
 ```swift
- 
+extension Task where Failure == Never {
+    public var value: Success {
+        get async {
+            // 调用到底层C++的 swift_task_future_wait
+            return await _taskFutureGet(_task)
+        }
+    }
+}
+extension Task {
+    public var value: Success {
+        get async throws {
+            // 调用到底层C++的 swift_task_future_wait_throwing
+            return try await _taskFutureGetThrowing(_task)
+        }
+    }
+}
+```
+第2个成员方法是异常版本(<font color = Red>关注异步函数的异常机制, 后续学习</font>), 但其实2个方法内部的核心流程一样的, [前面](#link-async-wait)已经做过注解, 先来回顾async下阻塞等待的基本流程:
+1. `cur-AsyncTask`中分离出`new-AsyncTask`
+2. `cur-AsyncTask`继续运行开始注册
+    - `cur-AsyncTask`修改自己的启动地址和上下文(其中包括`new-AsyncTask`存储结果或异常的位置)
+    - `cur-AsyncTask`注册自己到`new-AsyncTask`的等待链表上
+3. `new-AsyncTask`被创建后直接启动, 最后将整个运行的结果回传到第2步中指定的位置, 并启动`main-AsyncTask`
+
+以下面的测试案例来观察整个过程:
+
+```swift
+await Task {
+    20
+}.value     // task-AsyncTask会在主线程启动, 至于原因前面已经解释过了
 ```
 
+观察流程:
+1. async main中如何调用value? 
+2. value方法内如何调用到C++的底层
+3. async main中的`main-AsyncTask`注册过程
+4. `task-AsyncTask`执行完毕后怎么回传结果的
+
+先来看async main的汇编(笔者省略了程序启动的过程)
+
+```lua
+ mainThread
+; x22: main-ctx
+swift`async_Main:
+    0x1000032ac <+0>:   orr    x29, x29, #0x1000000000000000
+    0x1000032b0 <+4>:   sub    sp, sp, #0x50
+    0x1000032b4 <+8>:   stp    x29, x30, [sp, #0x40]
+    0x1000032b8 <+12>:  str    x22, [sp, #0x38]         ; *(sp + 0x38) = main-ctx
+    0x1000032bc <+16>:  add    x29, sp, #0x40           
+    0x1000032c0 <+20>:  str    x22, [sp, #0x20]         ; *(sp + 0x20) = main-ctx
+    0x1000032c4 <+24>:  mov    x8, x22                  ; x8 = mian-ctx
+    0x1000032c8 <+28>:  str    x8, [x22, #0x10]         ; (*main-ctx)<0x10 ~ 0x17 bit> = main-ctx, 上下文中第16字节的8字节一般存储的是自己(前面提到过很多次)
+    0x1000032cc <+32>:  adrp   x0, 5
+    0x1000032d0 <+36>:  add    x0, x0, #0x18            ; demangling cache variable for type metadata for Swift.Optional<Swift.TaskPriority>
+    0x1000032d4 <+40>:  bl     0x100003688              ; __swift_instantiateConcreteTypeFromMangledName at <compiler-generated>
+    0x1000032d8 <+44>:  ldur   x8, [x0, #-0x8]
+    0x1000032dc <+48>:  ldr    x8, [x8, #0x40]
+->  0x1000032e0 <+52>:  add    x8, x8, #0xf             
+    0x1000032e4 <+56>:  and    x0, x8, #0xfffffffffffffff0  ; x0 = 16
+    0x1000032e8 <+60>:  bl     0x100003ed0              ; symbol stub for: swift_task_alloc
+                                                        ; x0<TaskPriority?>(priority)
+                                                        ; PS: 这里并不是在创建异步任务, 而是利用当前异步任务的内存池创建一个  TaskPriority?的对象
+
+    0x1000032ec <+64>:  str    x0, [sp, #0x18]          ; *(sp + 0x18) = priority
+
+    0x1000032f0 <+68>:  bl     0x100003f00              ; symbol stub for: swift_task_getMainExecutor
+    0x1000032f4 <+72>:  str    x0, [x22, #0x20]         ; (*main-ctx)<0x20 ~ 0x27 bit> = gcd_main_q
+    0x1000032f8 <+76>:  str    x1, [x22, #0x28]         ; (*main-ctx)<0x28 ~ 0x2f bit> = MainActor.executorWitnessTable
+    0x1000032fc <+80>:  mov    x0, #0x0                 ; =0 
+    0x100003300 <+84>:  str    x0, [sp]                 ; *sp = nullptr
+    0x100003304 <+88>:  bl     0x100003e58              ; symbol stub for: type metadata accessor for Swift.TaskPriority
+    0x100003308 <+92>:  mov    x3, x0                   ; x3 = TaskPriority.metadata
+    0x10000330c <+96>:  ldr    x0, [sp, #0x18]          ; x0 = priority
+    0x100003310 <+100>: ldur   x8, [x3, #-0x8]          
+    0x100003314 <+104>: ldr    x8, [x8, #0x38]          ; x8 = storeEnumTagSinglePayload(OpaqueValue*, unsigned, unsigned, TargetMetadata*)
+                                                         
+    0x100003318 <+108>: mov    w2, #0x1                 ; =1 
+    0x10000331c <+112>: mov    x1, x2                   ; x1 = 1
+    0x100003320 <+116>: blr    x8                       ; 对priority进行初始化: priority = nil
+                                                        ; PS: Swift中的枚举赋值会调用底层的C++方法, 在这里相当于做上了编号标记(编号的概念在前面章节注解过)
+
+    0x100003324 <+120>: ldr    x0, [sp]                 ; x0 = sp
+    0x100003328 <+124>: bl     0x100003e40              ; symbol stub for: type metadata accessor for Swift.MainActor
+    0x10000332c <+128>: mov    x20, x0
+    0x100003330 <+132>: bl     0x100003e34              ; symbol stub for: static Swift.MainActor.shared.getter : Swift.MainActor
+    0x100003334 <+136>: str    x0, [sp, #0x8]
+    0x100003338 <+140>: bl     0x1000037b8              ; lazy protocol witness table accessor for type Swift.MainActor and conformance Swift.MainActor : Swift.Actor in Swift at <compiler-generated>
+    0x10000333c <+144>: str    x0, [sp, #0x10]
+                                                        ; *(sp + 0x8) = MainActor.shared
+                                                        ; *(sp + 0x10)= MainActor.witnessTable
+                                            
+    0x100003340 <+148>: adrp   x8, 1
+    0x100003344 <+152>: add    x8, x8, #0x160           ; _swift_FORCE_LOAD_$_swiftDispatch_$_swift + 8
+    0x100003348 <+156>: add    x0, x8, #0x10
+    0x10000334c <+160>: mov    w8, #0x20                ; =32 
+    0x100003350 <+164>: mov    x1, x8
+    0x100003354 <+168>: mov    w8, #0x7                 ; =7 
+    0x100003358 <+172>: mov    x2, x8
+    0x10000335c <+176>: bl     0x100003e7c              ; symbol stub for: swift_allocObject
+                                                        ; x0 = actor-ctx
+
+    0x100003360 <+180>: ldr    x9, [sp, #0x8]           ; x9 = MainActor.shared
+    0x100003364 <+184>: ldr    x8, [sp, #0x10]          ; x8 = MainActor.witnessTable
+    0x100003368 <+188>: mov    x2, x0                   ; x2 = heap
+    0x10000336c <+192>: ldr    x0, [sp, #0x18]          ; x0 = priority
+    0x100003370 <+196>: str    x9, [x2, #0x10]          ; (*actor-ctx)<0x10 ~ 0x17 bit> = MainActor.shared
+    0x100003374 <+200>: str    x8, [x2, #0x18]          ; (*actor-ctx)<0x18 ~ 0x1f bit> = MainActor.witnessTable
+    0x100003378 <+204>: adrp   x1, 5                    
+    0x10000337c <+208>: add    x1, x1, #0x30            ; async function pointer to partial apply forwarder for closure #1 () async -> Swift.Int in swift
+    0x100003380 <+212>: adrp   x3, 1
+    0x100003384 <+216>: ldr    x3, [x3, #0x40]          ; x3 = Int.metadata
+    0x100003388 <+220>: stur   x3, [x29, #-0x10]        ; *(x29 - 0x10) = Int.metedata
+    0x10000338c <+224>: bl     0x100003950              ; Swift.Task< where B == Swift.Never>.init(priority: Swift.Optional<Swift.TaskPriority>, operation: __owned @isolated(any) () async -> Success) -> Swift.Task<Success, Swift.Never> at <compiler-generated>
+                                                        ; 传递的参数:
+                                                        ;   x0<TaskPriority?> = nil
+                                                        ;   x1<() -> ()>(0x100008030)
+                                                        ;   x2<ActorContext*>(actor-ctx), 并不存在ActorContext的数据类型, 是笔者自定义的
+                                                        ;       因为Task.init的operation参数使用了 @isolated(any) 修饰, 所以编译器要传递当前调用点所在的隔离区(Actor对象)
+                                                        ;   x3<Metadata*>(Int.metadata)
+                                                        ;       模板参数, 闭包的返回值类型
+
+    0x100003390 <+228>: stur   x0, [x29, #-0x18]        ; *(x29 - 0x18) = task
+    0x100003394 <+232>: str    x0, [x22, #0x30]         ; (*main-ctx)<0x30 ~ 0x37 bit> = task
+    0x100003398 <+236>: adrp   x8, 1                
+    0x10000339c <+240>: ldr    x8, [x8, #0x38]
+    0x1000033a0 <+244>: ldr    w8, [x8, #0x4]
+    0x1000033a4 <+248>: mov    x0, x8                   ; x0 = 64, 由lldb调试得出
+    0x1000033a8 <+252>: bl     0x100003ed0              ; symbol stub for: swift_task_alloc
+                                                        ; x0 = ctx-1
+    0x1000033ac <+256>: ldr    x8, [sp, #0x20]          ; x8 = main-ctx
+    0x1000033b0 <+260>: ldur   x1, [x29, #-0x18]        ; x1 = task-AsyncTask
+    0x1000033b4 <+264>: ldur   x2, [x29, #-0x10]        ; x2 = Int.metadata
+    0x1000033b8 <+268>: mov    x22, x0                  ; x22 = ctx-1
+    0x1000033bc <+272>: mov    x0, x22                  
+    0x1000033c0 <+276>: str    x0, [x8, #0x38]          ; (*main-ctx)<0x38 ~ 0x3f bit> = ctx-1
+    0x1000033c4 <+280>: ldr    x9, [x8, #0x10]          ; x9 = main-ctx, 上下文的第16到第23bit存储的一般是自己
+    0x1000033c8 <+284>: str    x9, [x22]                ; (*ctx-1)<0 ~ 7 bit> = main-ctx, 记录父上下文
+    0x1000033cc <+288>: adrp   x9, 0                
+    0x1000033d0 <+292>: add    x9, x9, #0x3ec           ; async_MainTQ0_ at <compiler-generated>
+    0x1000033d4 <+296>: str    x9, [x22, #0x8]          ; (*ctx-1)<8 ~ 0xf bit> = 0x1000033ec, 记录Continuation的地址
+                                                        ;   这个地址是main-AsyncTask接收并处理完毕task-AsyncTask的结果后, 需要再次执行指令的地址
+    0x1000033d8 <+300>: add    x0, x8, #0x18            ; x0 = main-ctx + 0x18, 接收task-AsyncTask返回结果的地址
+    0x1000033dc <+304>: ldp    x29, x30, [sp, #0x40]
+    0x1000033e0 <+308>: and    x29, x29, #0xefffffffffffffff
+    0x1000033e4 <+312>: add    sp, sp, #0x50
+    0x1000033e8 <+316>: b      0x100003e64              ; symbol stub for: Swift.Task< where τ_0_1 == Swift.Never>.value.getter : τ_0_0
+```
+
+汇编执行到`<+316>`后将直接调用到C++的`swift_task_future_wait`:
+> 该函数在async let的章节曾经学习过, 不过这里在当前的测试案例下, 需要再次探究它
+
+```cpp
+// 主线程(当前的上下文是 main-AsyncTask)
+// 由前面的汇编调用过来:
+// result<Int*>(main-ctx + 0x18), task-AsyncTask需要将整个任务的执行结果存储到的位置
+// callerContext<AsyncContext*>(x22(ctx-1))
+// task<AsyncTask*>(x1(task-AsyncTask))
+// resumeFn<void(*)(AsyncContext*)>(x2(Task.value.getter)), 后续启动的其实是它的拆分函数
+// callContext<AsyncContext>(x3(ctx-1 + 0x10)), 还未初始化, 会在插入到task-AsyncTask前存储resumeFn
+// PS: 中间省略了一个函数, 该函数内部会初始化 x3 和 x2
+//     x2的地址: Task.getter, 也就是说main-AsyncTask逻辑上的启动点(task-AsyncTask执行完毕后要唤醒main-AsyncTask)
+//               是调用gtter获取返回值
+SWIFT_CC(swiftasync)
+static void swift_task_future_waitImpl(
+  OpaqueValue *result,
+  SWIFT_ASYNC_CONTEXT AsyncContext *callerContext,
+  AsyncTask *task,
+  TaskContinuationFunction *resumeFn,
+  AsyncContext *callContext) {
+
+  // main-AsyncTask, 表示需要停下来等待的task
+  auto waitingTask = swift_task_getCurrent();
+
+  // 重新指定main-AsyncTask的启动地址和上下文
+
+  // 所有等待机制中, 等待的异步任务被唤醒的函数是统一的, 然后在该统一的
+  // 函数内部再定位到resumFn
+  waitingTask->ResumeTask = task_future_wait_resume_adapter;
+  waitingTask->ResumeContext = callContext; // ctx-1 + 0x10
+
+  assert(task->isFuture());
+
+  
+  switch (task->waitFuture(waitingTask, callContext, resumeFn, callerContext,
+                           result)) {
+ 
+  // 如果task-AsyncTask还未结束, 则main-AsyncTask需要等待
+  //    返回(会进入到runloop睡眠)
+  case FutureFragment::Status::Executing:
+#ifdef __ARM_ARCH_7K__
+    return workaround_function_swift_task_future_waitImpl(
+        result, callerContext, task, resumeFn, callContext);
+#else   // true
+    return;
+#endif
+
+ // 如果task-AsyncTask已经结束(成功了), 则直接回调
+  case FutureFragment::Status::Success: {
+    auto future = task->futureFragment();
+    future->getResultType().vw_initializeWithCopy(result, future->getStoragePtr());
+    return resumeFn(callerContext);
+  }
+
+  // 如果task-AsyncTask有错误(异常), 则直接结束程序
+  // PS: 当前测试流程中没有对异步进行捕获, 如果源码中出现捕获, 则编程中会进入到swift_task_future_wait_throwingImpl
+  //     该函数内部和当前函数一样的流程, 只不过异常时并不会线程程序, 而是将异常反馈到main-AsyncTask
+  case FutureFragment::Status::Error:
+    swift_Concurrency_fatalError(0, "future reported an error, but wait cannot throw");
+  }
+}
+
+
+
+
+// this: task-AsyncTask
+FutureFragment::Status AsyncTask::waitFuture(
+   AsyncTask *waitingTask,              // main-AsyncTask
+   AsyncContext *waitingTaskContext,    // ctx-1 + 0x10
+   TaskContinuationFunction *resumeFn,  // Task.value.getter
+   AsyncContext *callerContext,         // ctx-1
+   OpaqueValue *result) {               // main-ctx + 0x18
+   using Status = FutureFragment::Status;
+  using WaitQueueItem = FutureFragment::WaitQueueItem;
+
+  assert(isFuture());
+
+  // 得到异步任务结果的存储空间起始地址
+  // PS: swift_task_create_commonImpl中详细注解过
+  auto fragment = futureFragment(); //task-AsyncTask + _1 + _2 + _3
+
+  // 等待链表
+  // 这里是直接CAS读取出结果和状态:
+  // waitQueue<2 ~ 63bit> = uintptr_t*, 指向结果的指针
+  // waitQueue<0 ~ 1 bit> = 标记(0(Executing, 1(Success), 2(Error))
+  auto queueHead = fragment->waitQueue.load(std::memory_order_acquire);
+
+  bool contextInitialized = false;
+
+  while (true) {
+    switch (queueHead.getStatus()) {
+
+    // 如果此刻状态下task-AsyncTask已经执行完毕并且有一个结果(成功和异常)
+    case Status::Error:
+    case Status::Success:
+      SWIFT_TASK_DEBUG_LOG("task %p waiting on task %p, completed immediately",
+                           waitingTask, this);
+      _swift_tsan_acquire(static_cast<Job *>(this));
+
+      // 标记main-AsyncTask为运行状态
+      if (contextInitialized) waitingTask->flagAsRunning();
+
+      // 直接告诉外界结果处理状态
+      return queueHead.getStatus();
+
+    // 以当前测试来看, 主线程执行到这里时很大可能task-AsyncTask还未被gcd的队列调度(即task-AsyncTask还未启动),
+    // 所以代码会进入到这个case, 该case中从流程上来看其实什么也没做
+    case Status::Executing:
+      SWIFT_TASK_DEBUG_LOG("task %p waiting on task %p, going to sleep",
+                           waitingTask, this);
+      _swift_tsan_release(static_cast<Job *>(waitingTask));
+
+      // 这里的调用只是跟踪性的代码(xcode辅助), 不需要关心
+      concurrency::trace::task_wait(
+          waitingTask, this, static_cast<uintptr_t>(queueHead.getStatus()));
+      break;
+    }
+
+
+#if false
+    这里笔者再注解一下:
+        整体上main-AsyncTask需要等待task-AsyncTask执行完毕,
+        虽然本测试中没有接收task-AsyncTask的返回值, 但程序不会缺少处理结果的步骤!!
+
+    大致流程:
+        1. task-AsyncTask执行最后一个异步函数, 获取到返回结果2
+
+        2. task-AsyncTask往前逐步返回, 并将结果2往回传递
+
+        3. task-AsyncTask往前返回到倒数第2个异步函数时, 会将2存储到f-AsyncTask.fragment.result中
+            这里牵扯到task-AsyncTask启动后result地址的传递过程, 前面swift_asyncLet_finish的过程已经详细注解过
+
+        4. task-AsyncTask返回到最后一个异步函数completeTaskWithClosure
+            该函数在创建task-AsyncTask时指定, 它需要的上下文其实就是task-ctx, 
+            而task-ctx本质就是 task-AsyncTask + headerSize
+
+        5. 第4步中将调用到completeTaskImpl
+            内部调用到 task-AsyncTask->completeFuture(task-ctx)
+
+        6. 在completeFuture内部, 遍历等待链表:
+            1. 取出main-AsyncTask
+            2. 取出上下文ctx-1 + 0x10(存储结果信息的上下文)
+            3. 将结果复制到ctx-1 + 0x10 的结果空间
+            4. 启动main-AsyncTask
+
+        7. 第6.4步:
+            1. 调用: task_future_wait_resume_adapter(ctx-1 + 0x10)
+            2. 内部会调用:  ctx-1 + 0x10 -> ResumeParent(ctx-1 + 0x10 ->Parent)
+            3. 第2步其实执行到了 Task.value.getter, 内部会再切换, 回到async main
+
+    在这个过程中main-AsyncTask需要:
+        1. 修改自己的启动地址和上下文(在上一个函数)
+            该上下文是用来存储task-AsyncTask执行的结果信息
+
+        2. 将自己注册到task-AsyncTask的等待链表(在该函数中)
+            
+#endif
+    // 初始化ctx-1 + 0x10
+    if (!contextInitialized) {
+      contextInitialized = true;
+      auto context =
+          reinterpret_cast<TaskFutureWaitAsyncContext *>(waitingTaskContext);
+      context->errorResult = nullptr;
+      context->successResultPointer = result;   // 指向结果的空间(main-ctx + 0x18)
+      context->ResumeParent = resumeFn;         // Task.value.getter
+      context->Parent = callerContext;          // ctx-1
+
+      // main-AsyncTask添加依赖
+      waitingTask->flagAsSuspendedOnTask(this);
+    }
+
+#if SWIFT_CONCURRENCY_TASK_TO_THREAD_MODEL
+    ... 省略了
+    lldb测试结论: swift该编译选项为0
+#else
+
+    // main-AsyncTask.SchedulerPrivate[NextWaitingTaskIndex] = link.latest(最新的表头结点)
+    waitingTask->getNextWaitingTask() = queueHead.getTask();
+
+    // 准备CAS
+    // newQueueHead<2 ~ 63bit>{.storage = main-AsyncTask}
+    // newQueueHead<0 ~ 1 bit>{0(Executing)} 
+    // PS: 指针共用, 低位的bit表示状态
+    // 
+    // task-AsyncTask在自己的等待链表上记录依赖者main-AsyncTask, 这样将来的第6步就可以操作
+    auto newQueueHead = WaitQueueItem::get(Status::Executing, waitingTask);
+    if (fragment->waitQueue.compare_exchange_weak(
+            queueHead, newQueueHead,
+            /*success*/ std::memory_order_release,
+            /*failure*/ std::memory_order_acquire)) {
+
+      _swift_task_clearCurrent();
+      return FutureFragment::Status::Executing;
+    }
+#endif /* SWIFT_CONCURRENCY_TASK_TO_THREAD_MODEL */
+  }
+}
+```
+
+上述是async main注册的过程, 注册完毕后等待到`task-AsyncTask`执行结束前, 然后进入唤醒流程. 下面的过程是`task-AsyncTask`从闭包开始往前返回: 这里从`completeTaskWithClosure`开始
+
+```cpp
+// 主线程, task-AsyncTask
+// context: task-ctx
+// error: nil
+// PS: 此刻上下文的状态中, 已经将闭包的返回值2存储到了 task-AsyncTask.fragment.result中了(笔者忽略了前面的异步函数过程)
+SWIFT_CC(swiftasync)
+static void completeTaskWithClosure(SWIFT_ASYNC_CONTEXT AsyncContext *context,
+                                    SWIFT_CONTEXT SwiftError *error) {
+  auto asyncContextPrefix = reinterpret_cast<AsyncContextPrefix *>(
+      reinterpret_cast<char *>(context) - sizeof(AsyncContextPrefix));
+
+  swift_release((HeapObject *)asyncContextPrefix->closureContext);
+
+  return completeTaskAndRelease(context, error);
+}
+
+SWIFT_CC(swiftasync)
+static void completeTaskAndRelease(SWIFT_ASYNC_CONTEXT AsyncContext *context,
+                                   SWIFT_CONTEXT SwiftError *error) {
+  // task-AsyncTask
+  auto task = _swift_task_clearCurrent();
+  assert(task && "completing task, but there is no active task registered");
+    
+  completeTaskImpl(task, context, error);
+
+  swift_release(task);
+}
+
+
+static void completeTaskImpl(AsyncTask *task,
+                             AsyncContext *context,
+                             SwiftError *error) {
+
+  auto asyncContextPrefix = reinterpret_cast<AsyncContextPrefix *>(
+      reinterpret_cast<char *>(context) - sizeof(AsyncContextPrefix));
+
+  asyncContextPrefix->errorResult = error;
+
+  task->Private.complete(task);
+
+  SWIFT_TASK_DEBUG_LOG("task %p completed", task);
+
+  if (task->isFuture()) {
+    task->completeFuture(context);
+  }
+}
+
+// 主线程,task-AsyncTask
+// context即为task-ctx
+void AsyncTask::completeFuture(AsyncContext *context) {
+  using Status = FutureFragment::Status;
+  using WaitQueueItem = FutureFragment::WaitQueueItem;
+  auto fragment = futureFragment();
+
+  // 找到存储结果的位置(这一点在前面的源码中已经注解过很多次了)
+  auto asyncContextPrefix = reinterpret_cast<FutureAsyncContextPrefix *>(
+      reinterpret_cast<char *>(context) - sizeof(FutureAsyncContextPrefix));
+  bool hadErrorResult = false;
+  auto errorObject = asyncContextPrefix->errorResult;
+  fragment->getError() = errorObject;
+  // false
+  if (errorObject) {
+    hadErrorResult = true;
+  }
+
+  _swift_tsan_release(static_cast<Job *>(this));
+
+  auto newQueueHead = WaitQueueItem::get(
+    hadErrorResult ? Status::Error : Status::Success,
+    nullptr
+  );
+
+  auto queueHead = fragment->waitQueue.exchange(
+      newQueueHead, std::memory_order_acq_rel);
+  assert(queueHead.getStatus() == Status::Executing);
+
+  if (hasGroupChildFragment()) {
+    auto group = groupChildFragment()->getGroup();
+    group->offer(this, context);
+  }
+
+  // main-AsyncTask
+  auto waitingTask = queueHead.getTask();
+
+  while (waitingTask) {
+    auto nextWaitingTask = waitingTask->getNextWaitingTask();
+
+    auto waitingContext =
+      static_cast<TaskFutureWaitAsyncContext *>(waitingTask->ResumeContext);
+    if (hadErrorResult) {
+      #if SWIFT_CONCURRENCY_EMBEDDED
+      swift_unreachable("untyped error used in embedded Swift");
+      #else
+      waitingContext->fillWithError(fragment);
+      #endif
+
+    } else {    // true
+      // 这里取出的是存储结果的地址(main-ctx + 0x18),
+      // 将fragment存储的2复制到main-ctx + 0x10指向的结果空间,
+      // 后续async main需要的话就从这里取
+      waitingContext->fillWithSuccess(fragment);
+    }
+
+    _swift_tsan_acquire(static_cast<Job *>(waitingTask));
+
+    concurrency::trace::task_resume(waitingTask);
+    
+    // 启动main-AsyncTask, 传递了SerialExecutor{nullpr, nullptr}, 所以会在并发队列中被调度
+    // 实际后续会执行task_future_wait_resume_adapter, 对应的上下文是 ctx-1 + 0x10
+    waitingTask->flagAsAndEnqueueOnExecutor(SerialExecutorRef::generic());
+
+    waitingTask = nextWaitingTask;
+  }
+}
+
+
+// 子线程, main-AsyncTask
+SWIFT_CC(swiftasync)
+static void
+task_future_wait_resume_adapter(SWIFT_ASYNC_CONTEXT AsyncContext *_context) {
+  // _context = ctx-1 + 0x10
+  // ctx-1 + 0x10在前面的注册过程中被初始化
+  // ctx-1 + 0x10 -> ResumeParent = Task.value.getter
+  // ctx-1 + 0x10 -> Parent = ctx-1
+  // (*ctx-1)<0 ~ 7 bit> = main-ctx
+  // (*ctx-1)<8 ~ 0xf bit> =  0x1000033ec
+  return _context->ResumeParent(_context->Parent);
+}
+```
+
+经过`task-AsyncTask`对结果的处理后, 将调用到`Task.value.getter`的拆分函数:
+
+```lua
+; 子线程, main-AsyncTask
+; x22: main-ctx
+libswift_Concurrency.dylib`(1) suspend resume partial function for Swift.Task< where τ_0_1 == Swift.Never>.value.getter : τ_0_0:
+    0x264956934 <+0>:  mov    x0, x22               ; x0 = main-ctx
+    0x264956938 <+4>:  ldr    x1, [x0, #0x8]!       ; x0 = main-ctx + 8, x1 = 0x1000033ec
+    0x26495693c <+8>:  mov    x16, x0
+    0x264956940 <+12>: movk   x16, #0xd707, lsl #48
+->  0x264956944 <+16>: braa   x1, x16               ; 指令跳转到 0x1000033ec
+
+
+; 子线程, main-AsyncTask
+; async main的拆分函数
+; x22: main-ctx
+; PS: main-ctx只是async main的上下文, 不是整个main-AsyncTask的上下文(实际上main-AsyncTask没有所谓的上下文)
+;    在该函数中将回到主线程后往前返回直到结束程序
+swift`async_MainTQ0_:
+->  0x1000033ec <+0>:   orr    x29, x29, #0x1000000000000000
+    0x1000033f0 <+4>:   sub    sp, sp, #0x20
+    0x1000033f4 <+8>:   stp    x29, x30, [sp, #0x10]
+    0x1000033f8 <+12>:  str    x22, [sp, #0x8]
+    0x1000033fc <+16>:  add    x29, sp, #0x10
+    0x100003400 <+20>:  ldr    x9, [x22]                ; x9 = super-ctx, 调用async main的异步函数(启动流程里有)
+    0x100003404 <+24>:  str    x9, [sp]                 ; *sp = super-ctx
+    0x100003408 <+28>:  mov    x8, x29                  
+    0x10000340c <+32>:  sub    x8, x8, #0x8
+    0x100003410 <+36>:  str    x9, [x8]
+    0x100003414 <+40>:  ldr    x0, [x9, #0x38]          ; x0 = main-ctx, 由于笔者省略了程序的启动过程, 所以不能展示出 super-ctx 的初始化过程
+                                                        ; 这里笔者直接给结论, 该值是 main-ctx
+    0x100003418 <+44>:  ldr    x8, [x22]
+    0x10000341c <+48>:  mov    x10, x29
+    0x100003420 <+52>:  sub    x10, x10, #0x8
+    0x100003424 <+56>:  str    x8, [x10]
+    0x100003428 <+60>:  str    x8, [x9, #0x10]          
+    0x10000342c <+64>:  bl     0x100003ef4              ; symbol stub for: swift_task_dealloc
+                                                        ; 释放 main-ctx
+    0x100003430 <+68>:  ldr    x8, [sp]                 ; x8 = super-ctx
+    0x100003434 <+72>:  ldr    x22, [x8, #0x10]         ; x22 = super-ctx, 这部分的空间存储的是自己
+    0x100003438 <+76>:  ldr    x2, [x8, #0x28]          ; x2 = mainActor.executorWitnessTable
+    0x10000343c <+80>:  ldr    x1, [x8, #0x20]          ; x1 = gcd_main_q
+    0x100003440 <+84>:  adrp   x0, 0
+    0x100003444 <+88>:  add    x0, x0, #0x458           ; async_MainTY1_ at <compiler-generated>
+    0x100003448 <+92>:  ldp    x29, x30, [sp, #0x10]
+    0x10000344c <+96>:  and    x29, x29, #0xefffffffffffffff
+    0x100003450 <+100>: add    sp, sp, #0x20
+    0x100003454 <+104>: b      0x100003f0c              ; symbol stub for: swift_task_switch
+                                                        ; 接下来会切换到主线程执行 0x100003458, 也就是main-AsyncTask往前返回的过程, 后续将结束程序
+``` 
+
+通过汇编的分析, Task本身没有自动等待机制, 只有手动调用了`value`后, 才会走等待的流程, 而这个流程其实和async finish的差不多, 其实都是为了处理返回值(<font color = red>当然也包括销毁创建的异步任务</font>
 
 ### TaskGroup
 
